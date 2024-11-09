@@ -11,13 +11,15 @@ void GcHeap::collect() {
     for (; ptr != nullptr; ptr = ptr->next_) {
         ptr->color_ = Color::WHITE;
     };
-    std::function<void(const GcObjectContainer*)> tracing_func = [&](const GcObjectContainer *ptr) {
+    std::function<void(const GcObjectContainer*)> tracing_func;
+    Tracer tracer{tracing_func};
+    tracing_func = [&](const GcObjectContainer *ptr) {
         if(ptr->color_ != Color::WHITE) {
             return;
         }
         ptr->color_ = Color::GRAY;
         if (auto traceable = ptr->as_tracable(); traceable != nullptr) {
-            traceable->trace(tracing_func);
+            traceable->trace(tracer);
         }
         ptr->color_ = Color::BLACK;
     };

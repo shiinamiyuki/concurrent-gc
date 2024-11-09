@@ -2,11 +2,28 @@
 #include <memory>
 #include <memory_resource>
 #include <functional>
-#define GC_ASSERT(x, msg) do{ if(!(x)) { std::printf("Assertion failed: %s\n", msg); std::abort(); } } while(0)
+#define GC_ASSERT(x, msg)                               \
+    do {                                                \
+        if (!(x)) {                                     \
+            std::printf("Assertion failed: %s\n", msg); \
+            std::abort();                               \
+        }                                               \
+    } while (0)
 namespace gc {
 class GcHeap;
 class GcObjectContainer;
 using TracingCallback = std::function<void(const GcObjectContainer *)>;
+template<class T>
+struct apply_trace {
+    void operator()(const TracingCallback &, const T &) const {}
+};
+struct Tracer {
+    TracingCallback &cb;
+    template<class... Ts>
+    void operator()(Ts &&...ts) const {
+        (apply_trace<std::decay_t<Ts>>{}(cb, std::forward<Ts>(ts)), ...);
+    }
+};
 enum Color {
     WHITE,
     GRAY,
@@ -14,9 +31,10 @@ enum Color {
 };
 class Traceable {
 public:
-    virtual void trace(const TracingCallback &) const = 0;
+    virtual void trace(const Tracer &) const = 0;
     ~Traceable() {}
 };
+
 class GcObjectContainer {
     template<class T>
     friend class Local;
@@ -82,8 +100,12 @@ class GcPtr {
     ContainerImpl<T> *container_;
     template<class T, class... Args>
     friend GcPtr<T> make_gc_ptr(Args &&...args);
+    template<class U>
+    friend struct apply_trace;
+
     explicit GcPtr(ContainerImpl<T> *container_) : container_(container_) {}
 public:
+    GcPtr() : container_(nullptr) {}
     T *operator->() const {
         return &container_->object_;
     }
@@ -91,6 +113,16 @@ public:
         return container_->object_;
     }
 };
+template<class T>
+struct apply_trace<GcPtr<T>> {
+    void operator()(const TracingCallback &cb, const GcPtr<T> &ptr) {
+        if (ptr.container_ == nullptr) {
+            return;
+        }
+        cb(ptr.container_);
+    }
+};
+
 template<class T, class... Args>
 GcPtr<T> make_gc_ptr(Args &&...args) {
     auto &heap = get_heap();
@@ -120,6 +152,4 @@ public:
         return ptr_.container_->object_;
     }
 };
-
-
 }// namespace gc
