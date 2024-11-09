@@ -2,10 +2,16 @@
 #include <memory>
 #include <memory_resource>
 #include <functional>
+#define GC_ASSERT(x, msg) do{ if(!(x)) { std::printf("Assertion failed: %s\n", msg); std::abort(); } } while(0)
 namespace gc {
 class GcHeap;
 class GcObjectContainer;
 using TracingCallback = std::function<void(const GcObjectContainer *)>;
+enum Color {
+    WHITE,
+    GRAY,
+    BLACK
+};
 class Traceable {
 public:
     virtual void trace(const TracingCallback &) const = 0;
@@ -16,7 +22,7 @@ class GcObjectContainer {
     friend class Local;
 protected:
     mutable bool is_root_ = false;
-    mutable bool is_marked_ = false;
+    mutable Color color_ = WHITE;
     friend class GcHeap;
     GcObjectContainer *next_ = nullptr;
 public:

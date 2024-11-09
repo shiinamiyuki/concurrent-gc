@@ -10,8 +10,11 @@ struct Foo : gc::Traceable {
     void trace(const gc::TracingCallback &) const override {}
 };
 int main() {
-    auto bar = gc::Local{gc::make_gc_ptr<Bar>(1)};
+    {
+        auto bar = gc::Local{gc::make_gc_ptr<Bar>(1)};
+        gc::get_heap().collect();
+        std::print("{}\n", bar->val);
+    }
     gc::get_heap().collect();
-    std::print("{}\n", bar->val);
     return 0;
 }

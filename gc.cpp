@@ -9,13 +9,17 @@ GcHeap &get_heap() {
 void GcHeap::collect() {
     auto *ptr = head_;
     for (; ptr != nullptr; ptr = ptr->next_) {
-        ptr->is_marked_ = false;
+        ptr->color_ = Color::WHITE;
     };
     std::function<void(const GcObjectContainer*)> tracing_func = [&](const GcObjectContainer *ptr) {
-        ptr->is_marked_ = true;
+        if(ptr->color_ != Color::WHITE) {
+            return;
+        }
+        ptr->color_ = Color::GRAY;
         if (auto traceable = ptr->as_tracable(); traceable != nullptr) {
             traceable->trace(tracing_func);
         }
+        ptr->color_ = Color::BLACK;
     };
     for (ptr = head_; ptr != nullptr; ptr = ptr->next_) {
         if (ptr->is_root_) {
@@ -26,7 +30,8 @@ void GcHeap::collect() {
     ptr = head_;
     while (ptr) {
         auto next = ptr->next_;
-        if (ptr->is_root_ || ptr->is_marked_) {
+        GC_ASSERT(ptr->color_ != Color::GRAY, "Object should not be gray");
+        if (ptr->is_root_ || ptr->color_ == Color::BLACK) {
             prev = ptr;
             ptr = next;
         } else {
