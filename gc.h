@@ -45,13 +45,16 @@ void clear_bit(I &bitmap) {
 }// namespace detail
 class GcHeap;
 class GcObjectContainer;
-using TracingCallback = std::function<void(const GcObjectContainer *)>;
+struct TracingContext {
+    std::vector<const GcObjectContainer *> work_list;
+    explicit TracingContext(std::vector<const GcObjectContainer *> work_list) : work_list(std::move(work_list)) {}
+};
 template<class T>
 struct apply_trace {
-    void operator()(const TracingCallback &, const T &) const {}
+    void operator()(TracingContext &, const T &) const {}
 };
 struct Tracer {
-    TracingCallback &cb;
+    TracingContext &cb;
     template<class... Ts>
     void operator()(Ts &&...ts) const {
         (apply_trace<std::decay_t<Ts>>{}(cb, std::forward<Ts>(ts)), ...);
@@ -161,6 +164,7 @@ public:
         return ptr;
     }
     void collect();
+    void mark_some();
     ~GcHeap() {
         collect();
         GC_ASSERT(head_ == nullptr, "Memory leak detected");
@@ -206,11 +210,11 @@ public:
 };
 template<class T>
 struct apply_trace<GcPtr<T>> {
-    void operator()(const TracingCallback &cb, const GcPtr<T> &ptr) {
+    void operator()(TracingContext &ctx, const GcPtr<T> &ptr) {
         if (ptr.container_ == nullptr) {
             return;
         }
-        cb(ptr.container_);
+        ctx.work_list.push_back(ptr.container_);
     }
 };
 

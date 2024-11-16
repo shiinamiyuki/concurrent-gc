@@ -17,12 +17,10 @@ struct Foo : gc::Traceable {
 int main() {
     {
         auto bar = gc::make_gc_ptr<Bar>(1234);
-        std::printf("bar is %p\n", static_cast<void *>(bar.gc_object_container()));
-        // auto foo = gc::Local{gc::make_gc_ptr<Foo>()};
-        // foo->bar = bar;
+        auto foo = gc::Local{gc::make_gc_ptr<Foo>()};
+        foo->bar = bar;
         gc::get_heap().collect();
         std::print("{}\n", bar->val);
     }
-    gc::get_heap().collect();
     return 0;
 }

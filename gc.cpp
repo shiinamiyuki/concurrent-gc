@@ -1,29 +1,49 @@
 #include "gc.h"
 #include <print>
+#include <deque>
 namespace gc {
 
 GcHeap &get_heap() {
     static thread_local GcHeap heap;
     return heap;
 }
+void GcHeap::mark_some() {
+}
 void GcHeap::collect() {
     auto *ptr = head_;
-    std::function<void(const GcObjectContainer *)> tracing_func;
-    Tracer tracer{tracing_func};
-    tracing_func = [&](const GcObjectContainer *ptr) {
-        if (ptr->color() != color::WHITE) {
+    // std::function<void(const GcObjectContainer *)> tracing_func;
+    // Tracer tracer{tracing_func};
+    std::deque<const GcObjectContainer *> work_list;
+    auto tracing_ctx = TracingContext{std::vector<const GcObjectContainer *>{}};
+    auto tracing_func = [&](const GcObjectContainer *ptr) {
+        if (ptr->color() == color::BLACK) {
             return;
         }
-        ptr->set_color(color::GRAY);
-        if (auto traceable = ptr->as_tracable(); traceable != nullptr) {
-            traceable->trace(tracer);
+        if (ptr->color() == color::GRAY) {
+            ptr->set_color(color::BLACK);
+            return;
         }
-        ptr->set_color(color::BLACK);
+        GC_ASSERT(ptr->color() == color::WHITE, "Object should be white");
+        ptr->set_color(color::GRAY);
+        tracing_ctx.work_list.clear();
+        if (auto tracable = ptr->as_tracable()) {
+            tracable->trace(Tracer{tracing_ctx});
+        }
+        for (auto *child : tracing_ctx.work_list) {
+            work_list.push_back(child);
+        }
+        work_list.push_back(ptr);
     };
+
     for (ptr = head_; ptr != nullptr; ptr = ptr->next_) {
         if (ptr->is_root()) {
             tracing_func(ptr);
         }
+    }
+    while (!work_list.empty()) {
+        auto *ptr = work_list.front();
+        work_list.pop_front();
+        tracing_func(ptr);
     }
     GcObjectContainer *prev = nullptr;
     ptr = head_;
