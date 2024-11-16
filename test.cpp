@@ -1,4 +1,5 @@
 #include "gc.h"
+#include "rc.h"
 #include <print>
 struct Bar : gc::Traceable {
     int val;
@@ -7,16 +8,18 @@ struct Bar : gc::Traceable {
 };
 struct Foo : gc::Traceable {
     gc::GcPtr<Bar> bar;
+    gc::GcPtr<std::string> s;
     Foo() = default;
     void trace(const gc::Tracer &tr) const override {
-        tr(bar);
+        tr(bar, s);
     }
 };
 int main() {
     {
-        auto bar = gc::make_gc_ptr<Bar>(1);
-        auto foo = gc::Local{gc::make_gc_ptr<Foo>()};
-        foo->bar = bar;
+        auto bar = gc::make_gc_ptr<Bar>(1234);
+        std::printf("bar is %p\n", static_cast<void *>(bar.gc_object_container()));
+        // auto foo = gc::Local{gc::make_gc_ptr<Foo>()};
+        // foo->bar = bar;
         gc::get_heap().collect();
         std::print("{}\n", bar->val);
     }
