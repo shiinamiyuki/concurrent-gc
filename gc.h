@@ -3,6 +3,8 @@
 #include <memory_resource>
 #include <functional>
 #include <utility>
+#include <deque>
+#include <unordered_set>
 #define GC_ASSERT(x, msg)                               \
     do {                                                \
         if (!(x)) [[unlikely]] {                        \
@@ -46,8 +48,9 @@ void clear_bit(I &bitmap) {
 class GcHeap;
 class GcObjectContainer;
 struct TracingContext {
-    std::vector<const GcObjectContainer *> work_list;
-    explicit TracingContext(std::vector<const GcObjectContainer *> work_list) : work_list(std::move(work_list)) {}
+    GcHeap &heap;
+    explicit TracingContext(GcHeap &heap) : heap(heap) {}
+    void shade(const GcObjectContainer *ptr) const noexcept;
 };
 template<class T>
 struct apply_trace {
@@ -60,39 +63,25 @@ struct Tracer {
         (apply_trace<std::decay_t<Ts>>{}(cb, std::forward<Ts>(ts)), ...);
     }
 };
+class Traceable;
 
-class Traceable {
-public:
-    virtual void trace(const Tracer &) const = 0;
-    ~Traceable() {}
-};
-namespace color {
-constexpr uint8_t WHITE = 0;
-constexpr uint8_t GRAY = 1;
-constexpr uint8_t BLACK = 2;
-}// namespace color
+// namespace color {
+// constexpr uint8_t WHITE = 0;
+// constexpr uint8_t GRAY = 1;
+// constexpr uint8_t BLACK = 2;
+// }// namespace color
 class GcObjectContainer {
     // we make this a base class so that we can handle classes that are not traceable
     template<class T>
     friend class Local;
 protected:
-    // 0th bit: is_root
-    // 1-2nd bit: color
+    friend class GcHeap;
+    // 0th bit: is_marked
     // highest bit: set to 1 if the object is not collected
     mutable uint8_t tag = 0;
-    friend class GcHeap;
+    mutable uint16_t root_ref_count = 0;
     mutable GcObjectContainer *next_ = nullptr;
-    void set_root(bool value) const {
-        if (value) {
-            detail::set_bit<0>(tag);
-        } else {
-            detail::clear_bit<0>(tag);
-        }
-    }
-    void set_color(uint8_t value) const {
-        tag &= 0b11111001;
-        tag |= (value << 1);
-    }
+
     void set_alive(bool value) const {
         if (value) {
             detail::set_bit<7>(tag);
@@ -100,43 +89,62 @@ protected:
             detail::clear_bit<7>(tag);
         }
     }
+    void set_marked(bool value) const {
+        if (value) {
+            detail::set_bit<0>(tag);
+        } else {
+            detail::clear_bit<0>(tag);
+        }
+    }
+    void inc_root_ref_count() const {
+        root_ref_count++;
+    }
+    void dec_root_ref_count() const {
+        root_ref_count--;
+    }
 public:
     bool is_root() const {
-        return detail::get_bit<0>(tag);
+        return root_ref_count > 0;
     }
-
-    uint8_t color() const {
-        return (tag >> 1) & 0b11;
+    bool is_marked() const {
+        return detail::get_bit<0>(tag);
     }
 
     bool is_alive() const {
         return detail::get_bit<7>(tag);
     }
     virtual ~GcObjectContainer() {}
-    virtual const Traceable *as_tracable() const { return nullptr; }
+    virtual const Traceable *as_tracable() const {
+        return nullptr;
+    }
 };
 template<class T>
 concept is_traceable = std::is_base_of<Traceable, T>::value;
-template<class T>
-class ContainerImpl : public GcObjectContainer {
+class Traceable : public GcObjectContainer {
+public:
+    virtual void trace(const Tracer &) const = 0;
+    const Traceable *as_tracable() const override {
+        return this;
+    }
+    ~Traceable() {}
+};
+template<typename T>
+class FallbackContainer : public GcObjectContainer {
+    static_assert(!is_traceable<T>, "This should only be used for non-traceable objects");
     T object_;
     template<class T>
     friend class Local;
     template<class T>
     friend class GcPtr;
 public:
-    explicit ContainerImpl(T &&object) : object_(std::move(object)) {}
-    ~ContainerImpl() override {}
-    const Traceable *as_tracable() const override {
-        if constexpr (is_traceable<T>) {
-            return static_cast<const Traceable *>(&object_);
-        } else {
-            return nullptr;
-        }
-    }
+    explicit FallbackContainer(T &&object) : object_(std::move(object)) {}
+    ~FallbackContainer() override {}
 };
 
 class GcHeap {
+    friend struct TracingContext;
+    template<class T>
+    friend class Member;
     std::pmr::unsynchronized_pool_resource pool_;
     std::pmr::polymorphic_allocator<void> alloc_;
     GcObjectContainer *head_ = nullptr;
@@ -146,11 +154,53 @@ class GcHeap {
         ptr->~GcObjectContainer();
         alloc_.deallocate_object(ptr);
     }
+    std::unordered_set<const GcObjectContainer *> work_list;
+    bool is_black(const GcObjectContainer *ptr) const {
+        return ptr->is_marked() && !is_grey(ptr);
+    }
+    bool is_grey(const GcObjectContainer *ptr) const {
+        return work_list.contains(ptr);
+    }
+    bool is_white(const GcObjectContainer *ptr) const {
+        return !ptr->is_marked();
+    }
+    void shade(const GcObjectContainer *ptr) {
+        if (!ptr) {
+            return;
+        }
+        ptr->set_marked(true);
+        if (ptr->as_tracable()) {
+            add_to_working_list(ptr);
+        }
+    }
+    template<class F>
+    void with_tracing_func(F &&f) {
+        auto tracing_ctx = TracingContext{*this};
+        auto tracing_func = [&](const GcObjectContainer *ptr) {
+            if (is_black(ptr)) {
+                return;
+            }
+            shade(ptr);
+        };
+        f(tracing_func);
+    }
+    const GcObjectContainer *pop_from_working_list() {
+        auto ptr = *work_list.begin();
+        work_list.erase(work_list.begin());
+        return ptr;
+    }
 public:
     GcHeap() : pool_(), alloc_(&pool_) {}
     template<class T, class... Args>
-    ContainerImpl<T> *_new_object(Args &&...args) {
-        auto ptr = alloc_.new_object<ContainerImpl<T>>(T(std::forward<Args>(args)...));
+    auto *_new_object(Args &&...args) {
+        using object_type = std::conditional_t<is_traceable<T>, T, FallbackContainer<T>>;
+        // auto ptr = alloc_.new_object<ContainerImpl<T>>(T(std::forward<Args>(args)...));
+        object_type *ptr{nullptr};
+        if constexpr (is_traceable<T>) {
+            ptr = alloc_.new_object<T>(std::forward<Args>(args)...);
+        } else {
+            ptr = alloc_.new_object<FallbackContainer<T>>(T(std::forward<Args>(args)...));
+        }
         if constexpr (is_debug) {
             std::printf("Allocated object %p\n", static_cast<void *>(ptr));
         }
@@ -164,48 +214,92 @@ public:
         return ptr;
     }
     void collect();
+    void scan_roots();
     void mark_some();
+    void add_to_working_list(const GcObjectContainer *ptr) {
+        work_list.insert(ptr);
+    }
     ~GcHeap() {
         collect();
         GC_ASSERT(head_ == nullptr, "Memory leak detected");
     }
 };
 GcHeap &get_heap();
+namespace detail {
+inline bool check_alive(const GcObjectContainer *ptr) {
+    if constexpr (is_debug) {
+        if (!ptr) {
+            return true;
+        }
+        if (!ptr->is_alive()) {
+            std::printf("Dangling pointer detected\n");
+            std::abort();
+        }
+    }
+    return true;
+}
+}// namespace detail
 template<class T>
-class GcPtr {
+class GcPtr {// here is the fallback implementation
     template<class T>
     friend class Local;
-    ContainerImpl<T> *container_;
+    template<class T>
+    friend class Member;
+    FallbackContainer<T> *container_;
     template<class T, class... Args>
     friend GcPtr<T> make_gc_ptr(Args &&...args);
     template<class U>
     friend struct apply_trace;
 
-    explicit GcPtr(ContainerImpl<T> *container_) : container_(container_) {}
-
-public:
+    explicit GcPtr(FallbackContainer<T> *container_) : container_(container_) {}
     GcPtr() : container_(nullptr) {}
+public:
+
     T *operator->() const {
-        check_alive();
+        detail::check_alive(container_);
         return &container_->object_;
     }
     T &operator*() const {
-        check_alive();
+        detail::check_alive(container_);
         return container_->object_;
     }
-    GcObjectContainer *gc_object_container() const {
+    const GcObjectContainer *gc_object_container() const {
         return container_;
     }
-    void check_alive() const {
-        if constexpr (is_debug) {
-            if (!container_) {
-                return;
-            }
-            if (!container_->is_alive()) [[unlikely]] {
-                std::printf("Dangling pointer detected\n");
-                std::abort();
-            }
-        }
+    bool operator==(const GcPtr<T> &other) const {
+        return container_ == other.container_;
+    }
+};
+/// @brief GcPtr is an reference to a gc object
+/// @brief GcPtr should never be stored in any object, but only for passing around
+template<is_traceable T>
+class GcPtr<T> {
+    template<class T>
+    friend class Local;
+    template<class T>
+    friend class Member;
+    // here is the traceable implementation
+    T *container_;
+    template<class T, class... Args>
+    friend GcPtr<T> make_gc_ptr(Args &&...args);
+    template<class U>
+    friend struct apply_trace;
+    explicit GcPtr(T *container_) : container_(container_) {}
+    GcPtr() : container_(nullptr) {}
+public:
+    T *operator->() const {
+        detail::check_alive(container_);
+        return static_cast<T *>(container_);
+    }
+    T &operator*() const {
+        detail::check_alive(container_);
+        return *static_cast<T *>(container_);
+    }
+    const GcObjectContainer *gc_object_container() const {
+        return container_;
+    }
+    bool operator==(const GcPtr<T> &other) const {
+        return container_ == other.container_;
     }
 };
 template<class T>
@@ -214,31 +308,34 @@ struct apply_trace<GcPtr<T>> {
         if (ptr.container_ == nullptr) {
             return;
         }
-        ctx.work_list.push_back(ptr.container_);
+        ctx.shade(ptr.gc_object_container());
     }
 };
 
-template<class T, class... Args>
-GcPtr<T> make_gc_ptr(Args &&...args) {
-    auto &heap = get_heap();
-    auto gc_ptr = GcPtr<T>{heap._new_object<T>(std::forward<Args>(args)...)};
-    return gc_ptr;
-}
+// template<class T, class... Args>
+// GcPtr<T> make_gc_ptr(Args &&...args) {
+//     auto &heap = get_heap();
+//     auto gc_ptr = GcPtr<T>{heap._new_object<T>(std::forward<Args>(args)...)};
+//     return gc_ptr;
+// }
+
+/// @brief an on stack handle to a gc object
 template<class T>
 class Local {
     GcPtr<T> ptr_;
-    bool _is_root = false;
 public:
-    Local(GcPtr<T> ptr) : ptr_(ptr), _is_root(ptr.container_->is_root()) {
-        if (!_is_root) {
-            ptr.container_->set_root(true);
-        }
+    explicit Local(GcPtr<T> ptr) : ptr_(ptr) {
+        ptr.gc_object_container()->inc_root_ref_count();
+    }
+    template<class... Args>
+    static Local make(Args &&...args) {
+        auto &heap = get_heap();
+        auto gc_ptr = GcPtr<T>{heap._new_object<T>(std::forward<Args>(args)...)};
+        return Local{gc_ptr};
     }
     // A local handle to a gc object
     ~Local() {
-        if (!_is_root) {
-            ptr_.container_->set_root(false);
-        }
+        ptr_.gc_object_container()->dec_root_ref_count();
     }
     T *operator->() const {
         return ptr_.operator->();
@@ -246,11 +343,32 @@ public:
     T &operator*() const {
         return ptr_.operator*();
     }
+    operator GcPtr<T>() const {
+        return ptr_;
+    }
 };
 template<class T>
 class Member {
     GcPtr<T> ptr_;
-
+    GcObjectContainer *parent_;
+    Member(GcPtr<T> ptr, GcObjectContainer *parent) : ptr_(ptr), parent_(parent) {}
 public:
+    template<is_traceable U>
+    explicit Member(U *parent) : ptr_(), parent_(parent) {}
+    // Dijsktra's write barrier
+    Member &operator=(const GcPtr<T> &ptr) {
+        if (ptr_ == ptr) {
+            return *this;
+        }
+        ptr_ = ptr;
+        if (ptr.gc_object_container() == nullptr) {
+            return *this;
+        }
+        auto &heap = get_heap();
+        if (heap.is_black(parent_)) {
+            heap.shade(ptr.gc_object_container());
+        }
+        return *this;
+    }
 };
 }// namespace gc
