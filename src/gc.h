@@ -71,36 +71,51 @@ struct Tracer {
 };
 class Traceable;
 
-// namespace color {
-// constexpr uint8_t WHITE = 0;
-// constexpr uint8_t GRAY = 1;
-// constexpr uint8_t BLACK = 2;
-// }// namespace color
+namespace color {
+constexpr uint8_t WHITE = 0;
+constexpr uint8_t GRAY = 1;
+constexpr uint8_t BLACK = 2;
+}// namespace color
+
+struct RootSet {
+    std::list<const GcObjectContainer *> roots;
+    using Node = std::list<const GcObjectContainer *>::iterator;
+    Node add(const GcObjectContainer *ptr) {
+        return roots.insert(roots.end(), ptr);
+    }
+    void remove(Node node) {
+        roots.erase(node);
+    }
+    auto begin() {
+        return roots.begin();
+    }
+    auto end() {
+        return roots.end();
+    }
+    size_t size() const {
+        return roots.size();
+    }
+};
+
 class GcObjectContainer {
     // we make this a base class so that we can handle classes that are not traceable
     template<class T>
     friend class Local;
+    template<class T>
+    friend class GcPtr;
 protected:
     friend class GcHeap;
-    // 0th bit: is_marked
-    // highest bit: set to 1 if the object is not collected
-    mutable uint8_t tag = 0;
+    mutable uint8_t color_ = color::WHITE;
+    mutable bool alive = true;
     mutable uint16_t root_ref_count = 0;
+    mutable RootSet::Node root_node = {};
     mutable GcObjectContainer *next_ = nullptr;
 
     void set_alive(bool value) const {
-        if (value) {
-            detail::set_bit<7>(tag);
-        } else {
-            detail::clear_bit<7>(tag);
-        }
+        alive = value;
     }
-    void set_marked(bool value) const {
-        if (value) {
-            detail::set_bit<0>(tag);
-        } else {
-            detail::clear_bit<0>(tag);
-        }
+    void set_color(uint8_t value) const {
+        color_ = value;
     }
     void inc_root_ref_count() const {
         root_ref_count++;
@@ -112,17 +127,17 @@ public:
     bool is_root() const {
         return root_ref_count > 0;
     }
-    bool is_marked() const {
-        return detail::get_bit<0>(tag);
+    uint8_t color() const {
+        return color_;
     }
-
     bool is_alive() const {
-        return detail::get_bit<7>(tag);
+        return alive;
     }
     virtual ~GcObjectContainer() {}
     virtual const Traceable *as_tracable() const {
         return nullptr;
     }
+    virtual size_t object_size() const = 0;
 };
 template<class T>
 concept is_traceable = std::is_base_of<Traceable, T>::value;
@@ -134,22 +149,38 @@ public:
     }
     ~Traceable() {}
 };
-template<typename T>
-class FallbackContainer : public GcObjectContainer {
-    static_assert(!is_traceable<T>, "This should only be used for non-traceable objects");
-    T object_;
-    template<class T>
-    friend class Local;
-    template<class T>
-    friend class GcPtr;
+template<class Self>
+class GarbageCollected : public Traceable {
 public:
-    explicit FallbackContainer(T &&object) : object_(std::move(object)) {}
-    ~FallbackContainer() override {}
+    size_t object_size() const override {
+        return sizeof(Self);
+    }
 };
 enum class GcMode : uint8_t {
     STOP_THE_WORLD,
     INCREMENTAL,
     CONCURRENT
+};
+struct WorkList {
+    std::deque<const GcObjectContainer *> list;
+    void append(const GcObjectContainer *ptr) {
+        list.push_back(ptr);
+    }
+    const GcObjectContainer *pop() {
+        GC_ASSERT(!list.empty(), "Work list should not be empty");
+        auto ptr = list.front();
+        list.pop_front();
+        return ptr;
+    }
+    bool empty() const {
+        return list.empty();
+    }
+};
+
+struct GcOption {
+    GcMode mode = GcMode::INCREMENTAL;
+    size_t max_heap_size = 1024 * 1024 * 1024;
+    double gc_threshold = 0.5;// when should a gc be triggered
 };
 class GcHeap {
     friend struct TracingContext;
@@ -158,22 +189,34 @@ class GcHeap {
     template<class T>
     friend class Local;
     GcMode mode_ = GcMode::INCREMENTAL;
+    size_t allocation_size_ = 0;
+    size_t max_heap_size_ = 0;
+    double gc_threshold_ = 0.5;
     std::pmr::unsynchronized_pool_resource pool_;
     std::pmr::polymorphic_allocator<void> alloc_;
     GcObjectContainer *head_ = nullptr;
+    RootSet root_set_;
+    enum class State {
+        IDLE,
+        MARKING,
+        SWEEPING
+    } state = State::IDLE;
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr) {
+        if constexpr (is_debug) {
+            std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), allocation_size_, max_heap_size_);
+        }
+        allocation_size_ -= ptr->object_size();
         ptr->set_alive(false);
         ptr->~GcObjectContainer();
         alloc_.deallocate_object(ptr);
     }
-    std::unordered_set<const GcObjectContainer *> work_list;
+    WorkList work_list;
 
     void shade(const GcObjectContainer *ptr) {
-        if (!ptr || ptr->is_marked()) {
+        if (!ptr || ptr->color() != color::WHITE)
             return;
-        }
-        ptr->set_marked(true);
+        ptr->set_color(color::GRAY);
         if (ptr->as_tracable()) {
             add_to_working_list(ptr);
         }
@@ -182,46 +225,111 @@ class GcHeap {
         if (!ptr) {
             return;
         }
+        GC_ASSERT(ptr->color() == color::GRAY || ptr->is_root(), "Object should be gray");
         auto ctx = TracingContext{*this};
         if (auto traceable = ptr->as_tracable()) {
             traceable->trace(Tracer{ctx});
         }
+        ptr->set_color(color::BLACK);
     }
     const GcObjectContainer *pop_from_working_list() {
-        auto ptr = *work_list.begin();
-        work_list.erase(work_list.begin());
-        return ptr;
+        return work_list.pop();
+    }
+    struct gc_ctor_token_t {};
+    void do_incremental(size_t inc_size) {
+        GC_ASSERT(state != State::SWEEPING, "State should not be sweeping");
+        if (state == State::MARKING) {
+            if constexpr (is_debug) {
+                std::printf("%lld items in work list\n", work_list.list.size());
+            }
+            for (int i = 0; i < 10; i++) {
+                if (!mark_some()) {
+                    sweep();
+                    return;
+                }
+            }
+            return;
+        }
+        GC_ASSERT(work_list.empty(), "Work list should be empty");
+        bool threshold_condition = allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
+        if constexpr (is_debug) {
+            std::printf("allocation_size_ = %lld, max_heap_size_ = %lld, inc_size = %lld\n", allocation_size_, max_heap_size_, inc_size);
+            std::printf("threshold_condition = %d\n", threshold_condition);
+        }
+        if (allocation_size_ + inc_size > max_heap_size_) {
+            state = State::MARKING;
+            while (mark_some()) {}
+            sweep();
+            return;
+        }
+        if (threshold_condition) {
+            if constexpr (is_debug) {
+                std::printf("threshold condition\n");
+            }
+            scan_roots();
+        }
+    }
+    struct gc_memory_resource : std::pmr::memory_resource {
+        GcHeap *heap;
+        void *do_allocate(std::size_t bytes, std::size_t alignment) override {
+            heap->on_allocation(bytes);
+            heap->allocation_size_ += bytes;
+            return heap->pool_.allocate(bytes, alignment);
+        }
+        void do_deallocate(void *p,
+                           std::size_t bytes,
+                           std::size_t alignment) override {
+            heap->allocation_size_ -= bytes;
+            heap->pool_.deallocate(p, bytes, alignment);
+        }
+        bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
+            return this == &other;
+        }
+    };
+    gc_memory_resource gc_memory_resource_;/// making gc aware of non-traceable memory usage
+
+    void on_allocation(size_t inc_size) {
+        if (mode_ != GcMode::STOP_THE_WORLD) {
+            do_incremental(inc_size);
+        } else {
+            if (allocation_size_ + inc_size > max_heap_size_) {
+                collect();
+            }
+        }
     }
 public:
-    bool is_black(const GcObjectContainer *ptr) const {
-        return ptr->is_marked() && !is_grey(ptr);
+    std::pmr::memory_resource *memory_resource() {
+        return &gc_memory_resource_;
     }
-    bool is_grey(const GcObjectContainer *ptr) const {
-        return work_list.contains(ptr);
+    RootSet &root_set() {
+        return root_set_;
     }
-    bool is_white(const GcObjectContainer *ptr) const {
-        return !ptr->is_marked();
+    GcHeap(GcOption option, gc_ctor_token_t) : pool_(), alloc_(&pool_) {
+        mode_ = option.mode;
+        max_heap_size_ = option.max_heap_size;
     }
+    GcHeap(const GcHeap &) = delete;
+    GcHeap &operator=(const GcHeap &) = delete;
+    GcHeap(GcHeap &&) = delete;
+    GcHeap &operator=(GcHeap &&) = delete;
     GcMode mode() const {
         return mode_;
     }
-    GcHeap() : pool_(), alloc_(&pool_) {}
+    static void init(GcOption option = {});
     template<class T, class... Args>
     auto *_new_object(Args &&...args) {
-        using object_type = std::conditional_t<is_traceable<T>, T, FallbackContainer<T>>;
-        // auto ptr = alloc_.new_object<ContainerImpl<T>>(T(std::forward<Args>(args)...));
-        object_type *ptr{nullptr};
-        if constexpr (is_traceable<T>) {
-            ptr = alloc_.new_object<T>(std::forward<Args>(args)...);
-        } else {
-            ptr = alloc_.new_object<FallbackContainer<T>>(T(std::forward<Args>(args)...));
-        }
+        on_allocation(sizeof(T));
+        GC_ASSERT(allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
+        auto ptr = alloc_.new_object<T>(std::forward<Args>(args)...);
+
         if constexpr (is_debug) {
-            std::printf("Allocated object %p\n", static_cast<void *>(ptr));
+            std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), allocation_size_, max_heap_size_);
         }
         ptr->set_alive(true);
         if (mode() != GcMode::STOP_THE_WORLD) {
-            shade(ptr);
+            if (state == State::MARKING) {
+                shade(ptr);
+            }
         }
         if (head_ == nullptr) {
             head_ = ptr;
@@ -229,6 +337,7 @@ public:
             ptr->next_ = head_;
             head_ = ptr;
         }
+        allocation_size_ += sizeof(T);
         return ptr;
     }
     void collect();
@@ -236,7 +345,7 @@ public:
     void scan_roots();
     bool mark_some();
     void add_to_working_list(const GcObjectContainer *ptr) {
-        work_list.insert(ptr);
+        work_list.append(ptr);
     }
     ~GcHeap() {
         sweep();
@@ -257,9 +366,12 @@ inline bool check_alive(const GcObjectContainer *ptr) {
 }// namespace detail
 template<typename T>
     requires(!is_traceable<T>)
-struct Adaptor : T, Traceable {
+struct Adaptor : Traceable, T {
     using T::T;
     void trace(const Tracer &) const override {}
+    size_t object_size() const override {
+        return sizeof(Adaptor<T>);
+    }
 };
 /// @brief GcPtr is an reference to a gc object
 /// @brief GcPtr should never be stored in any object, but only for passing around
@@ -293,6 +405,10 @@ public:
     bool operator==(const GcPtr<T> &other) const {
         return container_ == other.container_;
     }
+    RootSet::Node &root_node() const {
+        static_assert(std::is_base_of_v<GcObjectContainer, T>, "T should be a subclass of GcObjectContainer");
+        return container_->root_node;
+    }
 };
 template<class T>
 struct apply_trace<GcPtr<T>> {
@@ -303,12 +419,7 @@ struct apply_trace<GcPtr<T>> {
         ctx.shade(ptr.gc_object_container());
     }
 };
-template<class T>
-struct apply_trace<Member<T>> {
-    void operator()(TracingContext &ctx, const Member<T> &ptr) {
-        apply_trace<GcPtr<T>>{}(ctx, ptr.ptr_);
-    }
-};
+
 /// @brief an on stack handle to a gc object
 template<class T>
 class Local {
@@ -317,14 +428,19 @@ class Local {
         if (ptr_.gc_object_container()) {
             ptr_.gc_object_container()->inc_root_ref_count();
             if (ptr_.gc_object_container()->root_ref_count == 1) {
-                // become a new root, shade it
-                get_heap().shade(ptr_.gc_object_container());
+                // become a new root, add to the root set
+                auto node = get_heap().root_set().add(ptr_.gc_object_container());
+                ptr_.root_node() = node;
             }
         }
     }
     void dec() {
         if (ptr_.gc_object_container()) {
             ptr_.gc_object_container()->dec_root_ref_count();
+            if (ptr_.gc_object_container()->root_ref_count == 0) {
+                // remove from the root set
+                get_heap().root_set().remove(ptr_.root_node());
+            }
         }
     }
 public:
@@ -388,33 +504,47 @@ template<class T>
 class Member {
     template<class U>
     friend struct apply_trace;
+    template<class U>
+    friend class GcArray;
     GcPtr<T> ptr_;
     GcObjectContainer *parent_;
     Member(GcPtr<T> ptr, GcObjectContainer *parent) : ptr_(ptr), parent_(parent) {}
-public:
-    template<is_traceable U>
-    explicit Member(U *parent) : ptr_(), parent_(parent) {}
-    Member &operator=(std::nullptr_t) {
-        ptr_.reset();
-        return *this;
-    }
-    // Dijsktra's write barrier
-    Member &operator=(const GcPtr<T> &ptr) {
+
+    void update(GcPtr<T> ptr) {
         if (ptr_ == ptr) [[unlikely]] {
-            return *this;
+            return;
         }
         ptr_ = ptr;
         if (ptr.gc_object_container() == nullptr) {
-            return *this;
+            return;
         }
 
         auto &heap = get_heap();
-        if (heap.mode() != GcMode::STOP_THE_WORLD && heap.is_black(parent_)) {
+        if (heap.mode() != GcMode::STOP_THE_WORLD && parent_->color() == color::BLACK) {
             if constexpr (is_debug) {
                 std::printf("write barrier\n");
             }
             heap.shade(ptr.gc_object_container());
         }
+    }
+public:
+    template<is_traceable U>
+    explicit Member(U *parent) : ptr_(), parent_(parent) {}
+    Member(Member &&) = delete;
+    Member(const Member &) = delete;
+    Member &operator=(std::nullptr_t) {
+        ptr_.reset();
+        return *this;
+    }
+    Member &operator=(Member<T> &&) = delete;
+    Member &operator=(const Member<T> &other) {
+        GcPtr<T> ptr = other.ptr_;
+        update(ptr);
+        return *this;
+    }
+
+    Member &operator=(const GcPtr<T> &ptr) {
+        update(ptr);
         return *this;
     }
     T *operator->() const {
@@ -425,6 +555,41 @@ public:
     }
     const GcObjectContainer *gc_object_container() const {
         return ptr_.gc_object_container();
+    }
+    const GcObjectContainer *parent() const {
+        return parent_;
+    }
+};
+template<class T>
+struct apply_trace<Member<T>> {
+    void operator()(TracingContext &ctx, const Member<T> &ptr) {
+        apply_trace<GcPtr<T>>{}(ctx, ptr.ptr_);
+    }
+};
+template<class T>
+class GcArray : public GarbageCollected<GcArray<T>> {
+    std::pmr::vector<Member<T>> data_;
+public:
+    GcArray() : data_(get_heap().memory_resource()) {}
+    void push_back(GcPtr<T> ptr) {
+        data_.emplace_back(ptr, this);
+    }
+    void trace(const Tracer &tr) const override {
+        for (auto &ptr : data_) {
+            tr(ptr);
+        }
+    }
+    Member<T> &operator[](size_t idx) const {
+        return data_[idx];
+    }
+    size_t size() const {
+        return data_.size();
+    }
+    bool empty() const {
+        return data_.empty();
+    }
+    void pop_back() {
+        data_.pop_back();
     }
 };
 }// namespace gc
