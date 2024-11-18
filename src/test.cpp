@@ -70,15 +70,27 @@ void test_simple() {
 }
 void test_random() {
     gc::GcOption option{};
-    using Big = std::array<float, 1024>;
+    using Big = std::pmr::vector<float>;
     option.max_heap_size = 1024 * 16;
     gc::GcHeap::init(option);
+    auto &heap = gc::get_heap();
     // for (auto i = 0; i < 1000; i++) {
-        for (auto j = 0; j < 10000; j++) {
-            auto v = gc::Local<gc::Adaptor<Big>>::make();
-            // GC_ASSERT(v.gc_object_container()->object_size() == sizeof(Big), "size should be sizeof(Big)");
-            // gc::get_heap().collect();
-        }
+    for (auto j = 0; j < 2; j++) {
+        auto alloc = std::pmr::polymorphic_allocator<float>(heap.memory_resource());
+        // gc::Adaptor<std::pmr::vector<float>> v(alloc);
+        // GC_ASSERT(v.get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
+        // auto v2 = std::pmr::vector<float>(std::move(v));
+        // GC_ASSERT(v2.get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
+        // alloc.new_object<std::pmr::vector<float>>(alloc, alloc);
+        // v.resize(1000);
+        auto vec = gc::Local<gc::Adaptor<std::pmr::vector<float>>>::make(alloc);
+
+        vec->resize(1000);
+        GC_ASSERT(vec->get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
+        printf("vec size = %lld\n", vec->size());
+        // GC_ASSERT(v.gc_object_container()->object_size() == sizeof(Big), "size should be sizeof(Big)");
+        // gc::get_heap().collect();
+    }
     // }
 }
 int main() {

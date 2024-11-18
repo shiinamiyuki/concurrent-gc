@@ -73,6 +73,11 @@ void GcHeap::sweep() {
     state = State::IDLE;
 }
 void GcHeap::collect() {
+    auto ptr = head_;
+    while (ptr) {
+        ptr->set_color(color::WHITE);
+        ptr = ptr->next_;
+    }
     state = State::MARKING;
     scan_roots();
     while (!work_list.empty()) {

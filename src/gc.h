@@ -12,7 +12,9 @@
 #define GC_ASSERT(x, msg)                                    \
     do {                                                     \
         if (!(x)) [[unlikely]] {                             \
-            std::cerr << "Assertion failed: " << msg << "\n" \
+            std::cerr << "Assertion failed: at "             \
+                      << __FILE__ << ":" << __LINE__ << "\n" \
+                      << msg << "\n"                         \
                       << std::stacktrace::current()          \
                       << std::endl;                          \
             std::abort();                                    \
@@ -271,15 +273,22 @@ class GcHeap {
     }
     struct gc_memory_resource : std::pmr::memory_resource {
         GcHeap *heap;
+        gc_memory_resource(GcHeap *heap) : heap(heap) {}
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
             heap->on_allocation(bytes);
             heap->allocation_size_ += bytes;
+            if constexpr (is_debug) {
+                std::printf("Allocating %lld bytes via pmr, %lld/%lldB used\n", bytes, heap->allocation_size_, heap->max_heap_size_);
+            }
             return heap->pool_.allocate(bytes, alignment);
         }
         void do_deallocate(void *p,
                            std::size_t bytes,
                            std::size_t alignment) override {
             heap->allocation_size_ -= bytes;
+            if constexpr (is_debug) {
+                std::printf("Deallocating %lld bytes via pmr, %lld/%lldB used\n", bytes, heap->allocation_size_, heap->max_heap_size_);
+            }
             heap->pool_.deallocate(p, bytes, alignment);
         }
         bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
@@ -304,7 +313,7 @@ public:
     RootSet &root_set() {
         return root_set_;
     }
-    GcHeap(GcOption option, gc_ctor_token_t) : pool_(), alloc_(&pool_) {
+    GcHeap(GcOption option, gc_ctor_token_t) : pool_(), alloc_(&pool_), gc_memory_resource_{this} {
         mode_ = option.mode;
         max_heap_size_ = option.max_heap_size;
     }
@@ -317,10 +326,13 @@ public:
     }
     static void init(GcOption option = {});
     template<class T, class... Args>
+        requires std::constructible_from<T, Args...>
     auto *_new_object(Args &&...args) {
         on_allocation(sizeof(T));
         GC_ASSERT(allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
-        auto ptr = alloc_.new_object<T>(std::forward<Args>(args)...);
+        // auto ptr = alloc_.new_object<T>(std::forward<Args>(args)...);
+        auto ptr = alloc_.allocate_object<T>(1);
+        new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
 
         if constexpr (is_debug) {
             std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), allocation_size_, max_heap_size_);
@@ -348,7 +360,7 @@ public:
         work_list.append(ptr);
     }
     ~GcHeap() {
-        sweep();
+        collect();
         GC_ASSERT(head_ == nullptr, "Memory leak detected");
     }
 };
@@ -367,7 +379,16 @@ inline bool check_alive(const GcObjectContainer *ptr) {
 template<typename T>
     requires(!is_traceable<T>)
 struct Adaptor : Traceable, T {
-    using T::T;
+    // using T::T;
+    // template<typename = void>
+    //     requires std::is_move_constructible_v<T>
+    // Adaptor(T &&t) : T(std::move(t)) {}
+    // template<typename = void>
+    //     requires std::is_copy_constructible_v<T>
+    // Adaptor(const T &t) : T(t) {}
+    template<class... Args>
+        requires std::constructible_from<T, Args...>
+    Adaptor(Args &&...args) : T(std::forward<Args>(args)...) {}
     void trace(const Tracer &) const override {}
     size_t object_size() const override {
         return sizeof(Adaptor<T>);
@@ -377,9 +398,9 @@ struct Adaptor : Traceable, T {
 /// @brief GcPtr should never be stored in any object, but only for passing around
 template<class T>
 class GcPtr {
-    template<class T>
+    template<class U>
     friend class Local;
-    template<class T>
+    template<class U>
     friend class Member;
     // here is the traceable implementation
     T *container_;
@@ -455,6 +476,7 @@ public:
         inc();
     }
     template<class... Args>
+        requires std::constructible_from<T, Args...>
     static Local make(Args &&...args) {
         auto &heap = get_heap();
         auto gc_ptr = GcPtr<T>{heap._new_object<T>(std::forward<Args>(args)...)};
