@@ -40,12 +40,16 @@ void GcHeap::sweep() {
     if constexpr (is_debug) {
         std::println("starting sweep");
         auto obj_cnt = 0;
+        auto root_cnt = 0;
         auto ptr = head_;
         while (ptr) {
             obj_cnt++;
+            if (ptr->is_root()) {
+                root_cnt++;
+            }
             ptr = ptr->next_;
         }
-        std::printf("sweeping %d objects\n", obj_cnt);
+        std::printf("sweeping %d objects, %d roots\n", obj_cnt, root_cnt);
     }
     GcObjectContainer *prev = nullptr;
     auto ptr = head_;
@@ -61,7 +65,7 @@ void GcHeap::sweep() {
             ptr = next;
         } else {
             free_object(ptr);
-            GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
+            // GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
             if (!prev) {
                 head_ = next;
             } else {

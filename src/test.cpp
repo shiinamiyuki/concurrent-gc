@@ -3,20 +3,18 @@
 #include "rc.h"
 #include <print>
 #include <array>
-struct Bar : gc::GarbageCollected<Bar> {
+struct Bar : gc::Traceable {
     int val;
     explicit Bar(int val = 0) : val(val) {}
-    void trace(const gc::Tracer &) const override {}
+    GC_CLASS()
 };
 
-struct Foo : gc::GarbageCollected<Foo> {
+struct Foo : gc::Traceable {
     gc::Member<Bar> bar;
     gc::Member<gc::Adaptor<std::string>> s;
     gc::Member<Foo> foo;
     Foo() : bar(this), s(this), foo(this) {}
-    void trace(const gc::Tracer &tr) const override {
-        tr(bar, s, foo);
-    }
+    GC_CLASS(bar, s, foo)
 };
 void test_wb() {
     gc::GcHeap::init();
@@ -68,31 +66,56 @@ void test_simple() {
     heap.collect();
     std::print("foo still alive\n");
 }
+
 void test_random() {
     gc::GcOption option{};
-    using Big = std::pmr::vector<float>;
-    option.max_heap_size = 1024 * 16;
+    // option.mode = gc::GcMode::STOP_THE_WORLD;
+    // using Big = std::pmr::vector<float>;
+    option.max_heap_size = 1024;
     gc::GcHeap::init(option);
     auto &heap = gc::get_heap();
-    // for (auto i = 0; i < 1000; i++) {
-    for (auto j = 0; j < 2; j++) {
-        auto alloc = std::pmr::polymorphic_allocator<float>(heap.memory_resource());
-        // gc::Adaptor<std::pmr::vector<float>> v(alloc);
-        // GC_ASSERT(v.get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
-        // auto v2 = std::pmr::vector<float>(std::move(v));
-        // GC_ASSERT(v2.get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
-        // alloc.new_object<std::pmr::vector<float>>(alloc, alloc);
-        // v.resize(1000);
-        auto vec = gc::Local<gc::Adaptor<std::pmr::vector<float>>>::make(alloc);
+    using FloatVec = gc::GcVector<gc::Boxed<float>>;
+    sizeof(FloatVec);
 
-        vec->resize(1000);
-        GC_ASSERT(vec->get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
-        printf("vec size = %lld\n", vec->size());
-        // GC_ASSERT(v.gc_object_container()->object_size() == sizeof(Big), "size should be sizeof(Big)");
-        // gc::get_heap().collect();
+    // using FloatVec = gc::Adaptor<std::pmr::vector<float>>;
+    // for (auto i = 0; i < 1000; i++) {
+    for (auto j = 0; j < 1000; j++) {
+        // auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource());
+        auto v = gc::Local<FloatVec>::make();
+        GC_ASSERT(sizeof(FloatVec) == v->object_size(), "size should be the same");
+        // v->resize(100);
+        for (auto i = 0; i < 10; i++) {
+            v->push_back(gc::Local<gc::Boxed<float>>::make(static_cast<float>(i)));
+        }
     }
     // }
 }
+// void test_random() {
+//     gc::GcOption option{};
+//     option.mode = gc::GcMode::STOP_THE_WORLD;
+//     using Big = std::pmr::vector<float>;
+//     option.max_heap_size = 1024 * 10;
+//     gc::GcHeap::init(option);
+//     auto &heap = gc::get_heap();
+//     // for (auto i = 0; i < 1000; i++) {
+//     for (auto j = 0; j < 1000; j++) {
+//         auto alloc = std::pmr::polymorphic_allocator<float>(heap.memory_resource());
+//         // gc::Adaptor<std::pmr::vector<float>> v(alloc);
+//         // GC_ASSERT(v.get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
+//         // auto v2 = std::pmr::vector<float>(std::move(v));
+//         // GC_ASSERT(v2.get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
+//         // alloc.new_object<std::pmr::vector<float>>(alloc, alloc);
+//         // v.resize(1000);
+//         auto vec = gc::Local<gc::Adaptor<std::pmr::vector<float>>>::make(alloc);
+
+//         vec->resize(10);
+//         GC_ASSERT(vec->get_allocator().resource()->is_equal(*heap.memory_resource()), "memory resource should be the same");
+//         printf("vec size = %lld\n", vec->size());
+//         // GC_ASSERT(v.gc_object_container()->object_size() == sizeof(Big), "size should be sizeof(Big)");
+//         // gc::get_heap().collect();
+//     }
+//     // }
+// }
 int main() {
     test_random();
     return 0;

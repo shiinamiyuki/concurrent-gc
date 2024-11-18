@@ -8,6 +8,7 @@
 #include <stacktrace>
 #include <iostream>
 #include <print>
+#include <emmintrin.h>
 
 #define GC_ASSERT(x, msg)                                    \
     do {                                                     \
@@ -40,6 +41,22 @@ namespace detail {
 // uint16_t get_pointer_tag(T *ptr) {
 //     return static_cast<uint16_t>(reinterpret_cast<uintptr_t>(ptr) >> 48);
 // }
+struct spin_lock {// https://rigtorp.se/spinlock/
+    std::atomic<bool> lock_ = false;
+    void lock() {
+        for (;;) {
+            if (!lock_.exchange(true, std::memory_order_acquire)) {
+                break;
+            }
+            while (lock_.load(std::memory_order_relaxed)) {
+                _mm_pause();
+            }
+        }
+    }
+    void unlock() {
+        lock_.store(false, std::memory_order_release);
+    }
+};
 template<size_t Idx, typename I>
 constexpr bool get_bit(I bitmap) {
     return (bitmap >> Idx) & 1;
@@ -140,6 +157,7 @@ public:
         return nullptr;
     }
     virtual size_t object_size() const = 0;
+    virtual size_t object_alignment() const = 0;
 };
 template<class T>
 concept is_traceable = std::is_base_of<Traceable, T>::value;
@@ -151,13 +169,18 @@ public:
     }
     ~Traceable() {}
 };
-template<class Self>
-class GarbageCollected : public Traceable {
-public:
-    size_t object_size() const override {
-        return sizeof(Self);
+
+#define GC_CLASS(...)                                     \
+    void trace(const gc::Tracer &tracer) const override { \
+        tracer(__VA_ARGS__);                              \
+    }                                                     \
+    size_t object_size() const override {                 \
+        return sizeof(*this);                             \
+    }                                                     \
+    size_t object_alignment() const override {            \
+        return alignof(std::decay_t<decltype(*this)>);    \
     }
-};
+
 enum class GcMode : uint8_t {
     STOP_THE_WORLD,
     INCREMENTAL,
@@ -198,11 +221,13 @@ class GcHeap {
     std::pmr::polymorphic_allocator<void> alloc_;
     GcObjectContainer *head_ = nullptr;
     RootSet root_set_;
+    detail::spin_lock lock_;
     enum class State {
         IDLE,
         MARKING,
         SWEEPING
     } state = State::IDLE;
+    WorkList work_list;
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr) {
         if constexpr (is_debug) {
@@ -210,12 +235,16 @@ class GcHeap {
         }
         allocation_size_ -= ptr->object_size();
         ptr->set_alive(false);
+        auto size = ptr->object_size();
+        auto align = ptr->object_alignment();
         ptr->~GcObjectContainer();
-        alloc_.deallocate_object(ptr);
+        alloc_.deallocate_bytes(ptr, size, align);
     }
-    WorkList work_list;
 
     void shade(const GcObjectContainer *ptr) {
+        if (state != State::MARKING) {
+            return;
+        }
         if (!ptr || ptr->color() != color::WHITE)
             return;
         ptr->set_color(color::GRAY);
@@ -260,8 +289,7 @@ class GcHeap {
         }
         if (allocation_size_ + inc_size > max_heap_size_) {
             state = State::MARKING;
-            while (mark_some()) {}
-            sweep();
+            collect();
             return;
         }
         if (threshold_condition) {
@@ -275,19 +303,20 @@ class GcHeap {
         GcHeap *heap;
         gc_memory_resource(GcHeap *heap) : heap(heap) {}
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
-            heap->on_allocation(bytes);
+            heap->prepare_allocation(bytes);
             heap->allocation_size_ += bytes;
+            auto ptr = heap->pool_.allocate(bytes, alignment);
             if constexpr (is_debug) {
-                std::printf("Allocating %lld bytes via pmr, %lld/%lldB used\n", bytes, heap->allocation_size_, heap->max_heap_size_);
+                std::printf("Allocating %p, %lld bytes via pmr, %lld/%lldB used\n", ptr, bytes, heap->allocation_size_, heap->max_heap_size_);
             }
-            return heap->pool_.allocate(bytes, alignment);
+            return ptr;
         }
         void do_deallocate(void *p,
                            std::size_t bytes,
                            std::size_t alignment) override {
             heap->allocation_size_ -= bytes;
             if constexpr (is_debug) {
-                std::printf("Deallocating %lld bytes via pmr, %lld/%lldB used\n", bytes, heap->allocation_size_, heap->max_heap_size_);
+                std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, heap->allocation_size_, heap->max_heap_size_);
             }
             heap->pool_.deallocate(p, bytes, alignment);
         }
@@ -297,16 +326,27 @@ class GcHeap {
     };
     gc_memory_resource gc_memory_resource_;/// making gc aware of non-traceable memory usage
 
-    void on_allocation(size_t inc_size) {
-        if (mode_ != GcMode::STOP_THE_WORLD) {
-            do_incremental(inc_size);
-        } else {
-            if (allocation_size_ + inc_size > max_heap_size_) {
-                collect();
+    void prepare_allocation(size_t inc_size) {
+        with_lock([&] {
+            if (mode_ != GcMode::STOP_THE_WORLD) {
+                do_incremental(inc_size);
+            } else {
+                if (allocation_size_ + inc_size > max_heap_size_) {
+                    collect();
+                }
             }
-        }
+        });
     }
 public:
+    template<class F>
+    void with_lock(F &&f) noexcept {
+        if (mode_ == GcMode::CONCURRENT) {
+            std::unique_lock lock(lock_);
+            f();
+        } else {
+            f();
+        }
+    }
     std::pmr::memory_resource *memory_resource() {
         return &gc_memory_resource_;
     }
@@ -328,8 +368,9 @@ public:
     template<class T, class... Args>
         requires std::constructible_from<T, Args...>
     auto *_new_object(Args &&...args) {
-        on_allocation(sizeof(T));
+        prepare_allocation(sizeof(T));
         GC_ASSERT(allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
+
         // auto ptr = alloc_.new_object<T>(std::forward<Args>(args)...);
         auto ptr = alloc_.allocate_object<T>(1);
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
@@ -338,6 +379,7 @@ public:
             std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), allocation_size_, max_heap_size_);
         }
         ptr->set_alive(true);
+        GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
         if (mode() != GcMode::STOP_THE_WORLD) {
             if (state == State::MARKING) {
                 shade(ptr);
@@ -363,6 +405,13 @@ public:
         collect();
         GC_ASSERT(head_ == nullptr, "Memory leak detected");
     }
+    bool need_write_barrier() const {
+        if (mode_ == GcMode::STOP_THE_WORLD) {
+            return false;
+        }
+        // TODO: what about concurrent mode?
+        return state == State::MARKING;
+    }
 };
 GcHeap &get_heap();
 namespace detail {
@@ -376,6 +425,23 @@ inline bool check_alive(const GcObjectContainer *ptr) {
     return true;
 }
 }// namespace detail
+
+/// Thank you, C++
+template<typename T>
+    requires(!std::is_class_v<T>)
+struct Boxed : Traceable {
+    T value;
+    Boxed() = default;
+    Boxed(const T &value) : value(value) {}
+    Boxed(T &&value) : value(std::move(value)) {}
+    void trace(const Tracer &tracer) const override {}
+    size_t object_size() const {
+        return sizeof(Boxed<T>);
+    }
+    size_t object_alignment() const {
+        return alignof(Boxed<T>);
+    }
+};
 template<typename T>
     requires(!is_traceable<T>)
 struct Adaptor : Traceable, T {
@@ -392,6 +458,9 @@ struct Adaptor : Traceable, T {
     void trace(const Tracer &) const override {}
     size_t object_size() const override {
         return sizeof(Adaptor<T>);
+    }
+    size_t object_alignment() const override {
+        return alignof(Adaptor<T>);
     }
 };
 /// @brief GcPtr is an reference to a gc object
@@ -426,6 +495,9 @@ public:
     bool operator==(const GcPtr<T> &other) const {
         return container_ == other.container_;
     }
+    bool operator==(std::nullptr_t) const {
+        return container_ == nullptr;
+    }
     RootSet::Node &root_node() const {
         static_assert(std::is_base_of_v<GcObjectContainer, T>, "T should be a subclass of GcObjectContainer");
         return container_->root_node;
@@ -450,8 +522,15 @@ class Local {
             ptr_.gc_object_container()->inc_root_ref_count();
             if (ptr_.gc_object_container()->root_ref_count == 1) {
                 // become a new root, add to the root set
-                auto node = get_heap().root_set().add(ptr_.gc_object_container());
-                ptr_.root_node() = node;
+                auto &heap = get_heap();
+                get_heap().with_lock([&] {
+                    auto node = heap.root_set().add(ptr_.gc_object_container());
+                    if constexpr (is_debug) {
+                        std::printf("adding root %p\n", static_cast<const void *>(ptr_.gc_object_container()));
+                    }
+                    heap.shade(ptr_.gc_object_container());
+                    ptr_.root_node() = node;
+                });
             }
         }
     }
@@ -460,6 +539,9 @@ class Local {
             ptr_.gc_object_container()->dec_root_ref_count();
             if (ptr_.gc_object_container()->root_ref_count == 0) {
                 // remove from the root set
+                if constexpr (is_debug) {
+                    std::printf("removing root %p\n", static_cast<const void *>(ptr_.gc_object_container()));
+                }
                 get_heap().root_set().remove(ptr_.root_node());
             }
         }
@@ -507,6 +589,9 @@ public:
         return *this;
     }
     Local &operator=(const Local &other) {
+        if (ptr_ == other.ptr_) {
+            return *this;
+        }
         dec();
         ptr_ = other.ptr_;
         inc();
@@ -530,8 +615,9 @@ class Member {
     friend class GcArray;
     GcPtr<T> ptr_;
     GcObjectContainer *parent_;
-    Member(GcPtr<T> ptr, GcObjectContainer *parent) : ptr_(ptr), parent_(parent) {}
+    Member(GcObjectContainer *parent, GcPtr<T> ptr) : ptr_(ptr), parent_(parent) {}
 
+    // Dijkstra's write barrier
     void update(GcPtr<T> ptr) {
         if (ptr_ == ptr) [[unlikely]] {
             return;
@@ -542,11 +628,15 @@ class Member {
         }
 
         auto &heap = get_heap();
-        if (heap.mode() != GcMode::STOP_THE_WORLD && parent_->color() == color::BLACK) {
-            if constexpr (is_debug) {
-                std::printf("write barrier\n");
-            }
-            heap.shade(ptr.gc_object_container());
+        if (heap.need_write_barrier()) [[likely]] {
+            heap.with_lock([&] {
+                if (parent_->color() == color::BLACK) {
+                    if constexpr (is_debug) {
+                        std::printf("write barrier\n");
+                    }
+                    heap.shade(ptr.gc_object_container());
+                }
+            });
         }
     }
 public:
@@ -581,6 +671,15 @@ public:
     const GcObjectContainer *parent() const {
         return parent_;
     }
+    bool operator==(const GcPtr<T> &other) const {
+        return ptr_ == other;
+    }
+    bool operator==(const Member<T> &other) const {
+        return ptr_ == other.ptr_;
+    }
+    bool operator==(std::nullptr_t) const {
+        return ptr_ == nullptr;
+    }
 };
 template<class T>
 struct apply_trace<Member<T>> {
@@ -588,30 +687,95 @@ struct apply_trace<Member<T>> {
         apply_trace<GcPtr<T>>{}(ctx, ptr.ptr_);
     }
 };
+
+/// @brief Fixed size array of gc objects
 template<class T>
-class GcArray : public GarbageCollected<GcArray<T>> {
-    std::pmr::vector<Member<T>> data_;
+class GcArray : public Traceable {
+    Member<T> *data_;
+    size_t size_;
 public:
-    GcArray() : data_(get_heap().memory_resource()) {}
-    void push_back(GcPtr<T> ptr) {
-        data_.emplace_back(ptr, this);
-    }
-    void trace(const Tracer &tr) const override {
-        for (auto &ptr : data_) {
-            tr(ptr);
+    GcArray(size_t n) : data_(nullptr), size_(n) {
+        auto &heap = get_heap();
+        auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource());
+        data_ = alloc.allocate_object<Member<T>>(n);
+        for (size_t i = 0; i < n; i++) {
+            new (data_ + i) Member<T>(this);
         }
+    }
+    Member<T> &operator[](size_t idx) {
+        return data_[idx];
     }
     Member<T> &operator[](size_t idx) const {
         return data_[idx];
     }
     size_t size() const {
-        return data_.size();
+        return size_;
     }
     bool empty() const {
-        return data_.empty();
+        return size_ == 0;
     }
-    void pop_back() {
-        data_.pop_back();
+    void trace(const Tracer &tracer) const override {
+        for (size_t i = 0; i < size_; i++) {
+            tracer(data_[i]);
+        }
+    }
+    size_t object_size() const override {
+        return sizeof(*this);
+    }
+    size_t object_alignment() const override {
+        return alignof(GcArray<T>);
+    }
+    ~GcArray() {
+        auto &heap = get_heap();
+        auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource());
+        for (size_t i = 0; i < size_; i++) {
+            data_[i].~Member<T>();
+        }
+        alloc.deallocate_object(data_, size_);
     }
 };
+template<class T>
+class GcVector : public Traceable {
+    Member<GcArray<T>> data_;
+    size_t size_;
+
+    Local<GcArray<T>> alloc(size_t len) {
+        return Local<GcArray<T>>::make(len);
+    }
+    void ensure_size(size_t new_size) {
+        if (data_ == nullptr) {
+            data_ = alloc(new_size);
+            return;
+        }
+        if (new_size <= data_->size()) {
+            return;
+        }
+        auto new_capacity = std::max(data_->size() * 2, new_size);
+        Local<GcArray<T>> new_data = alloc(new_capacity);
+        for (size_t i = 0; i < data_->size(); i++) {
+            (*new_data)[i] = (*data_)[i];
+        }
+        data_ = new_data;
+    }
+public:
+    size_t capacity() const {
+        return data_.size();
+    }
+    GcVector() : data_(this), size_(0) {}
+    void push_back(GcPtr<T> value) {
+        ensure_size(size_ + 1);
+        (*data_)[size_++] = value;
+    }
+    T &operator[](size_t idx) {
+        return (*data_)[idx];
+    }
+    void pop_back() {
+        size_--;
+    }
+    size_t size() const {
+        return size_;
+    }
+    GC_CLASS(data_)
+};
+
 }// namespace gc
