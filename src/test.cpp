@@ -4,6 +4,7 @@
 #include <print>
 #include <random>
 #include <array>
+#include <numeric>
 struct Bar : gc::Traceable {
     int val;
     explicit Bar(int val = 0) : val(val) {}
@@ -100,6 +101,25 @@ struct Node : public gc::Traceable {
     }
     GC_CLASS(children)
 };
+template<typename T>
+auto find_all_nodes(gc::GcPtr<Node<T>> root) {
+    std::vector<gc::GcPtr<Node<T>>> nodes;
+    std::unordered_set<Node<T> *>
+        visited;
+    std::function<void(gc::GcPtr<Node<T>>)> dfs = [&](gc::GcPtr<Node<T>> node) {
+        if (visited.contains(node.get())) {
+            return;
+        }
+        visited.insert(node.get());
+        nodes.push_back(node);
+        auto num_children = node->children->size();
+        for (auto i = 0; i < num_children; i++) {
+            dfs(node->children->at(i));
+        }
+    };
+    dfs(root);
+    return nodes;
+}
 void test_random_graph() {
     gc::GcOption option{};
     option.max_heap_size = 1024 * 64;
@@ -114,11 +134,53 @@ void test_random_graph() {
             nodes.push_back(node);
         }
         for (int i = 0; i < 100; i++) {
-            auto& node = nodes[i];
+            auto &node = nodes[i];
             for (int j = 0; j < 10; j++) {
                 node->children->push_back(nodes[gen(rd) % nodes.size()]);
             }
         }
+    }
+}
+void test_random_graph2() {
+    gc::GcOption option{};
+    option.mode = gc::GcMode::INCREMENTAL;
+    option.max_heap_size = 1024 * 64;
+    option._full_debug = true;
+    gc::GcHeap::init(option);
+    std::random_device rd;
+    std::uniform_int_distribution<int> gen;
+    for (auto j = 0; j < 20; j++) {
+        gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
+        for (int i = 0; i < 100; i++) {
+            auto node = gc::Local<Node<int>>::make();
+            node->val = gen(rd);
+            root->children->push_back(node);
+        }
+        auto random_walk = [&](gc::GcPtr<Node<int>> node) -> gc::GcPtr<Node<int>> {
+            while (true) {
+                auto n_children = node->children->size();
+                if (n_children == 0) {
+                    return node;
+                }
+                auto idx = gen(rd) % n_children;
+                node = node->children->at(idx);
+                auto terminate = gen(rd) % 10;
+                if (terminate == 0) {
+                    return node;
+                }
+            }
+        };
+        for (auto i = 0; i < 1000; i++) {
+            auto node1 = random_walk(root);
+            auto node2 = random_walk(root);
+            node1->children->push_back(node2);
+        }
+        auto all_nodes = find_all_nodes(gc::GcPtr<Node<int>>(root));
+        printf("all_nodes.size() = %lld\n", all_nodes.size());
+        auto sum = std::accumulate(all_nodes.begin(), all_nodes.end(), 0, [](int acc, auto node) {
+            return acc + node->val;
+        });
+        printf("sum = %d\n", sum);
     }
 }
 // void test_random() {
@@ -148,6 +210,6 @@ void test_random_graph() {
 //     // }
 // }
 int main() {
-    test_random_graph();
+    test_random_graph2();
     return 0;
 }

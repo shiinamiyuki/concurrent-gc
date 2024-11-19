@@ -11,7 +11,7 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
     : mode_(option.mode),
       max_heap_size_(option.max_heap_size),
       gc_threshold_(option.gc_threshold),
-      pool_(option.mode == GcMode::CONCURRENT),
+      pool_(detail::LockProtected<detail::spin_lock, Pool>::emplace_t{}, option.mode == GcMode::CONCURRENT, option),
       object_list_(ObjectList{}, option.mode == GcMode::CONCURRENT),
       root_set_(RootSet{}, option.mode == GcMode::CONCURRENT),
       work_list(WorkList{}, option.mode == GcMode::CONCURRENT),
@@ -19,7 +19,14 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
 }
 void GcHeap::concurrent_collector() {
     while (!stop_collector_.load(std::memory_order_relaxed)) {
-        // TODO: implement concurrent collector
+        while (work_list.with([](auto &wl, auto *lock) {
+            return wl.empty();
+        })) {
+            detail::pause_thread();
+        }
+        scan_roots();
+        while (mark_some(10)) {}
+        sweep();
     }
 }
 void GcHeap::init(GcOption option) {
@@ -40,7 +47,9 @@ GcHeap &get_heap() {
 }
 
 bool GcHeap::mark_some(size_t max_count) {
-    GC_ASSERT(state == State::MARKING, "State should be marking");
+    if (mode_ != GcMode::CONCURRENT) {
+        GC_ASSERT(state() == State::MARKING, "State should be marking");
+    }
     return work_list.with([&](auto &wl, auto *lock) {
         for (auto i = 0; i < max_count; i++) {
             if (wl.empty()) {
@@ -53,7 +62,9 @@ bool GcHeap::mark_some(size_t max_count) {
     });
 }
 void GcHeap::scan_roots() {
-    state = State::MARKING;
+    if (mode_ != GcMode::CONCURRENT) {
+        state() = State::MARKING;
+    }
     root_set_.with([&](RootSet &rs, auto *lock) {
         if constexpr (is_debug) {
             std::printf("scanning %lld roots\n", rs.size());
@@ -68,7 +79,9 @@ void GcHeap::scan_roots() {
     });
 }
 void GcHeap::sweep() {
-    state = State::SWEEPING;
+    if (mode_ != GcMode::CONCURRENT) {
+        state() = State::SWEEPING;
+    }
     object_list_.with([&](auto &list, auto *lock) {
         if constexpr (is_debug) {
             std::println("starting sweep");
@@ -109,7 +122,7 @@ void GcHeap::sweep() {
         }
     });
 
-    state = State::IDLE;
+    state() = State::IDLE;
 }
 void GcHeap::collect() {
     auto object_list = object_list_.get();
@@ -119,7 +132,9 @@ void GcHeap::collect() {
         ptr = ptr->next_;
     }
     work_list.get().clear();
-    state = State::MARKING;
+    if (mode_ != GcMode::CONCURRENT) {
+        state() = State::MARKING;
+    }
     scan_roots();
     while (!work_list.get().empty()) {
         mark_some(10);
