@@ -8,7 +8,10 @@
 #include <stacktrace>
 #include <iostream>
 #include <print>
+#include <optional>
+#include <thread>
 #include <emmintrin.h>
+#include <mutex>
 
 #define GC_ASSERT(x, msg)                                    \
     do {                                                     \
@@ -69,6 +72,52 @@ template<size_t Idx, typename I>
 void clear_bit(I &bitmap) {
     bitmap &= ~(1 << Idx);
 }
+template<class T>
+concept Lockable = requires(T lock) {
+    lock.lock();
+    lock.unlock();
+};
+template<Lockable Lock, class T>
+class LockProtected {
+    T data;
+    std::optional<Lock> lock;
+public:
+    LockProtected() = delete;
+    LockProtected(bool enable) : data() {
+        if (enable) {
+            lock.emplace();
+        }
+    }
+    LockProtected(T data, bool enable) : data(std::move(data)) {
+        if (enable) {
+            lock.emplace();
+        }
+    }
+    template<class F>
+        requires std::invocable<F, T &, Lock *>
+    auto with(F &&f) -> decltype(auto) {
+        using R = std::invoke_result_t<F, T &, Lock *>;
+        if (lock.has_value()) {
+            lock->lock();
+        }
+        if constexpr (std::is_void_v<R>) {
+            f(data, lock.has_value() ? &lock.value() : nullptr);
+            if (lock.has_value()) {
+                lock->unlock();
+            }
+            return;
+        } else {
+            auto result = f(data, lock.has_value() ? &lock.value() : nullptr);
+            if (lock.has_value()) {
+                lock->unlock();
+            }
+            return result;
+        }
+    }
+    T &get() {
+        return data;
+    }
+};
 }// namespace detail
 class GcHeap;
 class GcObjectContainer;
@@ -200,6 +249,9 @@ struct WorkList {
     bool empty() const {
         return list.empty();
     }
+    void clear() {
+        list.clear();
+    }
 };
 
 struct GcOption {
@@ -213,32 +265,46 @@ class GcHeap {
     friend class Member;
     template<class T>
     friend class Local;
+    struct Pool {
+        size_t allocation_size_ = 0;
+        std::pmr::unsynchronized_pool_resource inner;
+        std::pmr::polymorphic_allocator<void> alloc_;
+    };
+    struct ObjectList {
+        GcObjectContainer *head = nullptr;
+    };
     GcMode mode_ = GcMode::INCREMENTAL;
-    size_t allocation_size_ = 0;
     size_t max_heap_size_ = 0;
     double gc_threshold_ = 0.5;
-    std::pmr::unsynchronized_pool_resource pool_;
-    std::pmr::polymorphic_allocator<void> alloc_;
-    GcObjectContainer *head_ = nullptr;
-    RootSet root_set_;
-    detail::spin_lock lock_;
+
+    // lock order: object_list -> pool
+
+    detail::LockProtected<detail::spin_lock, Pool> pool_;
+
+    detail::LockProtected<detail::spin_lock, ObjectList> object_list_;
+    detail::LockProtected<detail::spin_lock, RootSet> root_set_;
+    detail::LockProtected<std::mutex, WorkList> work_list;
+    std::optional<std::thread> collector_thread_;
     enum class State {
         IDLE,
         MARKING,
         SWEEPING
     } state = State::IDLE;
-    WorkList work_list;
+
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr) {
-        if constexpr (is_debug) {
-            std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), allocation_size_, max_heap_size_);
-        }
-        allocation_size_ -= ptr->object_size();
-        ptr->set_alive(false);
-        auto size = ptr->object_size();
-        auto align = ptr->object_alignment();
-        ptr->~GcObjectContainer();
-        alloc_.deallocate_bytes(ptr, size, align);
+
+        pool_.with([&](auto &pool, auto *lock) {
+            if constexpr (is_debug) {
+                std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), pool.allocation_size_, max_heap_size_);
+            }
+            pool.allocation_size_ -= ptr->object_size();
+            ptr->set_alive(false);
+            auto size = ptr->object_size();
+            auto align = ptr->object_alignment();
+            ptr->~GcObjectContainer();
+            pool.alloc_.deallocate_bytes(ptr, size, align);
+        });
     }
 
     void shade(const GcObjectContainer *ptr) {
@@ -264,30 +330,30 @@ class GcHeap {
         ptr->set_color(color::BLACK);
     }
     const GcObjectContainer *pop_from_working_list() {
-        return work_list.pop();
+        return work_list.get().pop();
     }
     struct gc_ctor_token_t {};
     void do_incremental(size_t inc_size) {
         GC_ASSERT(state != State::SWEEPING, "State should not be sweeping");
         if (state == State::MARKING) {
             if constexpr (is_debug) {
-                std::printf("%lld items in work list\n", work_list.list.size());
+                std::printf("%lld items in work list\n", work_list.get().list.size());
             }
-            for (int i = 0; i < 10; i++) {
-                if (!mark_some()) {
-                    sweep();
-                    return;
-                }
+
+            if (!mark_some(10)) {
+                sweep();
+                return;
             }
+
             return;
         }
-        GC_ASSERT(work_list.empty(), "Work list should be empty");
-        bool threshold_condition = allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
+        GC_ASSERT(work_list.get().empty(), "Work list should be empty");
+        bool threshold_condition = pool_.get().allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
         if constexpr (is_debug) {
-            std::printf("allocation_size_ = %lld, max_heap_size_ = %lld, inc_size = %lld\n", allocation_size_, max_heap_size_, inc_size);
+            std::printf("allocation_size_ = %lld, max_heap_size_ = %lld, inc_size = %lld\n", pool_.get().allocation_size_, max_heap_size_, inc_size);
             std::printf("threshold_condition = %d\n", threshold_condition);
         }
-        if (allocation_size_ + inc_size > max_heap_size_) {
+        if (pool_.get().allocation_size_ + inc_size > max_heap_size_) {
             state = State::MARKING;
             collect();
             return;
@@ -304,59 +370,67 @@ class GcHeap {
         gc_memory_resource(GcHeap *heap) : heap(heap) {}
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
             heap->prepare_allocation(bytes);
-            heap->allocation_size_ += bytes;
-            auto ptr = heap->pool_.allocate(bytes, alignment);
-            if constexpr (is_debug) {
-                std::printf("Allocating %p, %lld bytes via pmr, %lld/%lldB used\n", ptr, bytes, heap->allocation_size_, heap->max_heap_size_);
-            }
-            return ptr;
+            return heap->pool_.with([&](auto &pool, auto *lock) -> void * {
+                pool.allocation_size_ += bytes;
+                auto ptr = pool.inner.allocate(bytes, alignment);
+                if constexpr (is_debug) {
+                    std::printf("Allocating %p, %lld bytes via pmr, %lld/%lldB used\n", ptr, bytes, pool.allocation_size_, heap->max_heap_size_);
+                }
+                return ptr;
+            });
         }
         void do_deallocate(void *p,
                            std::size_t bytes,
                            std::size_t alignment) override {
-            heap->allocation_size_ -= bytes;
-            if constexpr (is_debug) {
-                std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, heap->allocation_size_, heap->max_heap_size_);
-            }
-            heap->pool_.deallocate(p, bytes, alignment);
+            return heap->pool_.with([&](auto &pool, auto *lock) {
+                pool.allocation_size_ -= bytes;
+                if constexpr (is_debug) {
+                    std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, pool.allocation_size_, heap->max_heap_size_);
+                }
+                pool.inner.deallocate(p, bytes, alignment);
+            });
         }
         bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
             return this == &other;
         }
     };
     gc_memory_resource gc_memory_resource_;/// making gc aware of non-traceable memory usage
-
-    void prepare_allocation(size_t inc_size) {
-        with_lock([&] {
-            if (mode_ != GcMode::STOP_THE_WORLD) {
-                do_incremental(inc_size);
-            } else {
-                if (allocation_size_ + inc_size > max_heap_size_) {
-                    collect();
-                }
-            }
-        });
+    std::condition_variable work_list_non_empty_;
+    std::condition_variable mem_available_;
+    std::atomic_bool stop_collector_ = false;
+    void do_concurrent(size_t inc_size) {
+        // std::unique_lock lock(lock_);
+        // GC_ASSERT(state != State::SWEEPING, "State should not be sweeping");
+        // auto is_mem_available = [=]() {
+        //     return allocation_size_ + inc_size < max_heap_size_;
+        // };
+        // while (!is_mem_available()) {
+        //     std::this_thread::yield();
+        // }
+        // bool threshold_condition = allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
+        GC_ASSERT(false, "Not implemented");
     }
-public:
-    template<class F>
-    void with_lock(F &&f) noexcept {
-        if (mode_ == GcMode::CONCURRENT) {
-            std::unique_lock lock(lock_);
-            f();
+    void prepare_allocation(size_t inc_size) {
+
+        if (mode_ == GcMode::INCREMENTAL) {
+            do_incremental(inc_size);
+        } else if (mode_ == GcMode::CONCURRENT) {
+            do_concurrent(inc_size);
         } else {
-            f();
+            if (pool_.get().allocation_size_ + inc_size > max_heap_size_) {
+                collect();
+            }
         }
     }
+    void concurrent_collector();
+public:
     std::pmr::memory_resource *memory_resource() {
         return &gc_memory_resource_;
     }
-    RootSet &root_set() {
+    auto &root_set() {
         return root_set_;
     }
-    GcHeap(GcOption option, gc_ctor_token_t) : pool_(), alloc_(&pool_), gc_memory_resource_{this} {
-        mode_ = option.mode;
-        max_heap_size_ = option.max_heap_size;
-    }
+    GcHeap(GcOption option, gc_ctor_token_t);
     GcHeap(const GcHeap &) = delete;
     GcHeap &operator=(const GcHeap &) = delete;
     GcHeap(GcHeap &&) = delete;
@@ -369,41 +443,50 @@ public:
         requires std::constructible_from<T, Args...>
     auto *_new_object(Args &&...args) {
         prepare_allocation(sizeof(T));
-        GC_ASSERT(allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
 
         // auto ptr = alloc_.new_object<T>(std::forward<Args>(args)...);
-        auto ptr = alloc_.allocate_object<T>(1);
-        new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
+        auto ptr = pool_.with([&](Pool &pool, auto *lock) {
+            GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
+            auto ptr = pool.alloc_.allocate_object<T>(1);
+            new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
 
-        if constexpr (is_debug) {
-            std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), allocation_size_, max_heap_size_);
-        }
-        ptr->set_alive(true);
-        GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
+            if constexpr (is_debug) {
+                std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_, max_heap_size_);
+            }
+            ptr->set_alive(true);
+            GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
+
+            pool.allocation_size_ += sizeof(T);
+            return ptr;
+        });
         if (mode() != GcMode::STOP_THE_WORLD) {
             if (state == State::MARKING) {
                 shade(ptr);
             }
         }
-        if (head_ == nullptr) {
-            head_ = ptr;
-        } else {
-            ptr->next_ = head_;
-            head_ = ptr;
-        }
-        allocation_size_ += sizeof(T);
+        object_list_.with([&](auto &list, auto *lock) {
+            if (list.head == nullptr) {
+                list.head = ptr;
+            } else {
+                ptr->next_ = list.head;
+                list.head = ptr;
+            }
+        });
         return ptr;
     }
     void collect();
     void sweep();
     void scan_roots();
-    bool mark_some();
+    bool mark_some(size_t max_count);
     void add_to_working_list(const GcObjectContainer *ptr) {
-        work_list.append(ptr);
+        work_list.get().append(ptr);
     }
     ~GcHeap() {
+        if (collector_thread_.has_value()) {
+            collector_thread_->join();
+        }
         collect();
-        GC_ASSERT(head_ == nullptr, "Memory leak detected");
+        GC_ASSERT(object_list_.get().head == nullptr, "Memory leak detected");
     }
     bool need_write_barrier() const {
         if (mode_ == GcMode::STOP_THE_WORLD) {
@@ -523,13 +606,15 @@ class Local {
             if (ptr_.gc_object_container()->root_ref_count == 1) {
                 // become a new root, add to the root set
                 auto &heap = get_heap();
-                get_heap().with_lock([&] {
-                    auto node = heap.root_set().add(ptr_.gc_object_container());
+                get_heap().root_set().with([&](auto &rs, auto *lock) {
+                    auto node = rs.add(ptr_.gc_object_container());
                     if constexpr (is_debug) {
                         std::printf("adding root %p\n", static_cast<const void *>(ptr_.gc_object_container()));
                     }
-                    heap.shade(ptr_.gc_object_container());
                     ptr_.root_node() = node;
+                });
+                get_heap().work_list.with([&](auto &work_list, auto *lock) {
+                    heap.shade(ptr_.gc_object_container());
                 });
             }
         }
@@ -542,7 +627,11 @@ class Local {
                 if constexpr (is_debug) {
                     std::printf("removing root %p\n", static_cast<const void *>(ptr_.gc_object_container()));
                 }
-                get_heap().root_set().remove(ptr_.root_node());
+
+                auto &heap = get_heap();
+                get_heap().root_set().with([&](auto &rs, auto *lock) {
+                    rs.remove(ptr_.root_node());
+                });
             }
         }
     }
@@ -628,16 +717,16 @@ class Member {
         }
 
         auto &heap = get_heap();
-        if (heap.need_write_barrier()) [[likely]] {
-            heap.with_lock([&] {
+        heap.work_list.with([&](auto &work_list, auto *lock) {
+            if (heap.need_write_barrier()) [[likely]] {
                 if (parent_->color() == color::BLACK) {
                     if constexpr (is_debug) {
                         std::printf("write barrier\n");
                     }
                     heap.shade(ptr.gc_object_container());
                 }
-            });
-        }
+            }
+        });
     }
 public:
     template<is_traceable U>
@@ -767,6 +856,12 @@ public:
         (*data_)[size_++] = value;
     }
     T &operator[](size_t idx) {
+        return (*data_)[idx];
+    }
+    T &at(size_t idx) const {
+        if (idx >= size_) {
+            throw std::out_of_range("Index out of range");
+        }
         return (*data_)[idx];
     }
     void pop_back() {
