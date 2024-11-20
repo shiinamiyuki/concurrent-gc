@@ -2,39 +2,105 @@
 #include <optional>
 namespace gc {
 void TracingContext::shade(const GcObjectContainer *ptr) const noexcept {
-    heap.work_list.with([&](auto &wl, auto *lock) {
-        heap.shade(ptr);
-    });
+    // heap.work_list.with([&](auto &wl, auto *lock) {
+    heap.shade(ptr);
+    // });
 }
-static thread_local std::optional<GcHeap> heap = std::nullopt;
+void GcHeap::shade(const GcObjectContainer *ptr) {
+    if (mode_ != GcMode::CONCURRENT) {
+        if (state() != State::MARKING) {
+            return;
+        }
+    }
+    if (!ptr || ptr->color() != color::WHITE)
+        return;
+    ptr->set_color(color::GRAY);
+    if (ptr->as_tracable()) {
+        add_to_working_list(ptr);
+    }
+}
+static std::shared_ptr<GcHeap> heap;
 GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
     : mode_(option.mode),
       max_heap_size_(option.max_heap_size),
       gc_threshold_(option.gc_threshold),
-      pool_(detail::LockProtected<detail::spin_lock, Pool>::emplace_t{}, option.mode == GcMode::CONCURRENT, option),
+      pool_(detail::LockProtected<std::recursive_mutex, Pool>::emplace_t{}, option.mode == GcMode::CONCURRENT, option),
       object_list_(ObjectList{}, option.mode == GcMode::CONCURRENT),
       root_set_(RootSet{}, option.mode == GcMode::CONCURRENT),
       work_list(WorkList{}, option.mode == GcMode::CONCURRENT),
       gc_memory_resource_(this) {
 }
+void GcHeap::signal_collection() {
+    if constexpr (is_debug) {
+        std::printf("Signaling collection\n");
+    }
+    pool_.get().concurrent_state = State::MARKING;
+}
+void GcHeap::do_concurrent(size_t inc_size) {
+    pool_.with([&](auto &pool, auto *lock) {
+        auto is_mem_available = [&]() {
+            return pool.allocation_size_ + inc_size < max_heap_size_;
+        };
+        auto threshold = [&]() -> bool {
+            return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
+        };
+        while (pool.concurrent_state == State::SWEEPING) {
+            lock->unlock();
+            std::this_thread::yield();
+            lock->lock();
+        }
+        if (!is_mem_available() || threshold()) {
+            signal_collection();
+            while (pool.concurrent_state == State::SWEEPING) {
+                lock->unlock();
+                std::this_thread::yield();
+                lock->lock();
+            }
+            GC_ASSERT(is_mem_available(), "Out of memory");
+        }
+    });
+}
 void GcHeap::concurrent_collector() {
     while (!stop_collector_.load(std::memory_order_relaxed)) {
-        while (work_list.with([](auto &wl, auto *lock) {
-            return wl.empty();
-        })) {
-            detail::pause_thread();
+        pool_.with([&](Pool &pool, auto *lock) {
+            while (pool.concurrent_state == State::IDLE && !stop_collector_.load(std::memory_order_relaxed)) {
+                lock->unlock();
+                std::this_thread::yield();
+                lock->lock();
+            }
+            if (stop_collector_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            GC_ASSERT(pool.concurrent_state == State::MARKING, "State should be marking");
+            if constexpr (is_debug) {
+                std::printf("Starting concurrent collection\n");
+            }
+        });
+        if (stop_collector_.load(std::memory_order_relaxed)) {
+            return;
         }
+
         scan_roots();
         while (mark_some(10)) {}
+        pool_.with([&](Pool &pool, auto *lock) {
+            GC_ASSERT(pool.concurrent_state == State::MARKING, "State should be marking");
+            pool.concurrent_state = State::SWEEPING;
+        });
         sweep();
+        pool_.with([&](Pool &pool, auto *lock) {
+            pool.concurrent_state = State::IDLE;
+            if constexpr (is_debug) {
+                std::printf("Concurrent collection done\n");
+            }
+        });
     }
 }
 void GcHeap::init(GcOption option) {
-    if (heap.has_value()) {
+    if (heap) {
         std::fprintf(stderr, "Heap is already initialized\n");
         return std::abort();
     }
-    heap.emplace(option, gc_ctor_token_t{});
+    heap = std::make_shared<GcHeap>(option, gc_ctor_token_t{});
     if (option.mode == GcMode::CONCURRENT) {
         heap->collector_thread_.emplace([&] {
             heap->concurrent_collector();
@@ -42,8 +108,8 @@ void GcHeap::init(GcOption option) {
     }
 }
 GcHeap &get_heap() {
-    GC_ASSERT(heap.has_value(), "Heap is not initialized");
-    return heap.value();
+    GC_ASSERT(heap != nullptr, "Heap is not initialized");
+    return *heap;
 }
 
 bool GcHeap::mark_some(size_t max_count) {
@@ -70,11 +136,17 @@ void GcHeap::scan_roots() {
             std::printf("scanning %lld roots\n", rs.size());
         }
         for (auto root : rs) {
+            // if (mode() != GcMode::CONCURRENT) {
+            //     // in concurrent mode, root can remove itself from the root set while being scanned
+            //     GC_ASSERT(root->is_root(), "Root should be root");
+            // }
             GC_ASSERT(root->is_root(), "Root should be root");
             if constexpr (is_debug) {
                 std::printf("scanning root %p\n", static_cast<const void *>(root));
             }
-            scan(root);
+            work_list.with([&](auto &wl, auto *lock) {
+                scan(root);
+            });
         }
     });
 }
@@ -101,6 +173,9 @@ void GcHeap::sweep() {
         auto ptr = list.head;
         while (ptr) {
             auto next = ptr->next_;
+            // if (mode() != GcMode::CONCURRENT) {
+            //     GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
+            // }
             GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
             if (ptr->is_root()) {
                 GC_ASSERT(ptr->color() == color::BLACK, "Root should be black");
@@ -121,8 +196,9 @@ void GcHeap::sweep() {
             }
         }
     });
-
-    state() = State::IDLE;
+    if (mode_ != GcMode::CONCURRENT) {
+        state() = State::IDLE;
+    }
 }
 void GcHeap::collect() {
     if constexpr (is_debug) {

@@ -147,9 +147,9 @@ void test_random_graph() {
 }
 void test_random_graph2() {
     gc::GcOption option{};
-    option.mode = gc::GcMode::INCREMENTAL;
-    option.max_heap_size = 1024 * 64;
-    option._full_debug = false;
+    option.mode = gc::GcMode::CONCURRENT;
+    option.max_heap_size = 1024 * 128;
+    option._full_debug = true;
     gc::GcHeap::init(option);
     std::random_device rd;
     std::uniform_int_distribution<int> gen;
@@ -157,7 +157,7 @@ void test_random_graph2() {
         gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
         for (int i = 0; i < 100; i++) {
             auto node = gc::Local<Node<int>>::make();
-            node->val = gen(rd);
+            node->val = i;
             root->children->push_back(node);
         }
         auto random_walk = [&](gc::GcPtr<Node<int>> node) -> gc::GcPtr<Node<int>> {
@@ -214,6 +214,6 @@ void test_random_graph2() {
 //     // }
 // }
 int main() {
-    test_wb();
+    test_random_graph2();
     return 0;
 }

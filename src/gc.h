@@ -51,22 +51,23 @@ inline void pause_thread() {
     std::this_thread::yield();
 #endif
 }
-struct spin_lock {// https://rigtorp.se/spinlock/
-    std::atomic<bool> lock_ = false;
-    void lock() {
-        for (;;) {
-            if (!lock_.exchange(true, std::memory_order_acquire)) {
-                break;
-            }
-            while (lock_.load(std::memory_order_relaxed)) {
-                pause_thread();
-            }
-        }
-    }
-    void unlock() {
-        lock_.store(false, std::memory_order_release);
-    }
-};
+// struct spin_lock {// https://rigtorp.se/spinlock/
+//     std::atomic<bool> lock_ = false;
+//     void lock() {
+//         for (;;) {
+//             if (!lock_.exchange(true, std::memory_order_acquire)) {
+//                 break;
+//             }
+//             while (lock_.load(std::memory_order_relaxed)) {
+//                 pause_thread();
+//             }
+//         }
+//     }
+//     void unlock() {
+//         lock_.store(false, std::memory_order_release);
+//     }
+// };
+using spin_lock = std::mutex;
 template<size_t Idx, typename I>
 constexpr bool get_bit(I bitmap) {
     return (bitmap >> Idx) & 1;
@@ -190,7 +191,8 @@ protected:
     mutable uint8_t color_ = color::WHITE;
     mutable bool alive = true;
     mutable uint16_t root_ref_count = 0;
-    mutable RootSet::Node root_node = {};
+    /// @brief if we were using rust, the below field might only take 8 bytes...
+    mutable std::optional<RootSet::Node> root_node = {};
     mutable GcObjectContainer *next_ = nullptr;
 
     void set_alive(bool value) const {
@@ -207,7 +209,8 @@ protected:
     }
 public:
     bool is_root() const {
-        return root_ref_count > 0;
+        // return root_ref_count > 0;
+        return root_node.has_value();
     }
     uint8_t color() const {
         return color_;
@@ -295,10 +298,16 @@ class GcHeap {
     friend class Member;
     template<class T>
     friend class Local;
+    enum class State {
+        IDLE,
+        MARKING,
+        SWEEPING
+    };
     struct Pool {
         size_t allocation_size_ = 0;
         std::unique_ptr<std::pmr::memory_resource> inner;
         std::optional<std::pmr::polymorphic_allocator<void>> alloc_;
+        State concurrent_state = State::IDLE;
         Pool(GcOption option) {
             if (option._full_debug) {
                 inner = std::make_unique<std::pmr::monotonic_buffer_resource>();
@@ -317,17 +326,13 @@ class GcHeap {
 
     // lock order: object_list -> pool
 
-    detail::LockProtected<detail::spin_lock, Pool> pool_;
+    detail::LockProtected<std::recursive_mutex, Pool> pool_;
 
     detail::LockProtected<detail::spin_lock, ObjectList> object_list_;
     detail::LockProtected<detail::spin_lock, RootSet> root_set_;
     detail::LockProtected<detail::spin_lock, WorkList> work_list;
     std::optional<std::thread> collector_thread_;
-    enum class State {
-        IDLE,
-        MARKING,
-        SWEEPING
-    } state_ = State::IDLE;
+    State state_ = State::IDLE;
     State &state() {
         GC_ASSERT(mode_ != GcMode::CONCURRENT, "State should not be accessed in concurrent mode");
         return state_;
@@ -347,23 +352,23 @@ class GcHeap {
             pool.alloc_->deallocate_bytes(ptr, size, align);
         });
     }
-
-    void shade(const GcObjectContainer *ptr) {
-        if (state() != State::MARKING) {
-            return;
-        }
-        if (!ptr || ptr->color() != color::WHITE)
-            return;
-        ptr->set_color(color::GRAY);
-        if (ptr->as_tracable()) {
-            add_to_working_list(ptr);
-        }
-    }
+    /// @brief `shade` itself do not acquire the lock on work_list
+    /// @param ptr
+    void shade(const GcObjectContainer *ptr);
+    /// @brief scan a gray object and possibly add its children to the work list
+    /// scan doees not acquire the lock on work_list
+    /// @param ptr
     void scan(const GcObjectContainer *ptr) {
         if (!ptr) {
             return;
         }
-        GC_ASSERT(ptr->color() == color::GRAY || ptr->is_root(), "Object should be gray");
+        if constexpr (is_debug) {
+            std::printf("scanning %p\n", static_cast<const void *>(ptr));
+        }
+        if (mode() != GcMode::CONCURRENT) {
+            GC_ASSERT(ptr->color() == color::GRAY || ptr->is_root(), "Object should be gray");
+        }
+
         auto ctx = TracingContext{*this};
         if (auto traceable = ptr->as_tracable()) {
             traceable->trace(Tracer{ctx});
@@ -442,18 +447,11 @@ class GcHeap {
     // std::condition_variable work_list_non_empty_;
     // std::condition_variable mem_available_;
     std::atomic_bool stop_collector_ = false;
-    void do_concurrent(size_t inc_size) {
-        // std::unique_lock lock(lock_);
-        // GC_ASSERT(state != State::SWEEPING, "State should not be sweeping");
-        // auto is_mem_available = [=]() {
-        //     return allocation_size_ + inc_size < max_heap_size_;
-        // };
-        // while (!is_mem_available()) {
-        //     std::this_thread::yield();
-        // }
-        // bool threshold_condition = allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
-        GC_ASSERT(false, "Not implemented");
-    }
+    /*
+    Mutator threads only cares about `pool.allocaion_available_` 
+     */
+    void signal_collection();
+    void do_concurrent(size_t inc_size);
     void prepare_allocation(size_t inc_size) {
 
         if (mode_ == GcMode::INCREMENTAL) {
@@ -489,24 +487,29 @@ public:
         prepare_allocation(sizeof(T));
 
         auto ptr = pool_.with([&](Pool &pool, auto *lock) {
+            if (mode() == GcMode::CONCURRENT) {
+                GC_ASSERT(pool.concurrent_state != State::SWEEPING, "State should not be sweeping");
+            }
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
             auto ptr = pool.alloc_->allocate_object<T>(1);
-            new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
-
             if constexpr (is_debug) {
                 std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_, max_heap_size_);
             }
-            ptr->set_alive(true);
-            GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
 
             pool.allocation_size_ += sizeof(T);
-            if (mode() != GcMode::STOP_THE_WORLD) {
-                // this is necessary, you can't just color it black since the above line `T(std::forward<Args>(args)...);`
-                // invokes the constructor and might setup some member pointers
-                shade(ptr);
-            }
             return ptr;
         });
+        new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
+        GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
+        ptr->set_alive(true);
+
+        if (mode() != GcMode::STOP_THE_WORLD) {
+            // this is necessary, you can't just color it black since the above line `T(std::forward<Args>(args)...);`
+            // invokes the constructor and might setup some member pointers
+            work_list.with([&](auto &work_list, auto *lock) {
+                shade(ptr);
+            });
+        }
 
         object_list_.with([&](auto &list, auto *lock) {
             if (list.head == nullptr) {
@@ -523,9 +526,13 @@ public:
     void scan_roots();
     bool mark_some(size_t max_count);
     void add_to_working_list(const GcObjectContainer *ptr) {
+        if constexpr (is_debug) {
+            std::printf("adding %p to work list\n", static_cast<const void *>(ptr));
+        }
         work_list.get().append(ptr);
     }
     ~GcHeap() {
+        stop_collector_ = true;
         if (collector_thread_.has_value()) {
             collector_thread_->join();
         }
@@ -574,13 +581,6 @@ struct Boxed : Traceable {
 template<typename T>
     requires(!is_traceable<T>)
 struct Adaptor : Traceable, T {
-    // using T::T;
-    // template<typename = void>
-    //     requires std::is_move_constructible_v<T>
-    // Adaptor(T &&t) : T(std::move(t)) {}
-    // template<typename = void>
-    //     requires std::is_copy_constructible_v<T>
-    // Adaptor(const T &t) : T(t) {}
     template<class... Args>
         requires std::constructible_from<T, Args...>
     Adaptor(Args &&...args) : T(std::forward<Args>(args)...) {}
@@ -630,7 +630,7 @@ public:
     bool operator==(std::nullptr_t) const {
         return container_ == nullptr;
     }
-    RootSet::Node &root_node() const {
+    std::optional<RootSet::Node> &root_node() const {
         static_assert(std::is_base_of_v<GcObjectContainer, T>, "T should be a subclass of GcObjectContainer");
         return container_->root_node;
     }
@@ -660,7 +660,7 @@ class Local {
                     if constexpr (is_debug) {
                         std::printf("adding root %p\n", static_cast<const void *>(ptr_.gc_object_container()));
                     }
-                    ptr_.root_node() = node;
+                    ptr_.root_node().emplace(node);
                 });
                 get_heap().work_list.with([&](auto &work_list, auto *lock) {
                     heap.shade(ptr_.gc_object_container());
@@ -679,7 +679,8 @@ class Local {
 
                 auto &heap = get_heap();
                 get_heap().root_set().with([&](auto &rs, auto *lock) {
-                    rs.remove(ptr_.root_node());
+                    rs.remove(*ptr_.root_node());
+                    ptr_.root_node().reset();
                 });
             }
         }
