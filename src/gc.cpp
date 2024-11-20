@@ -125,6 +125,9 @@ void GcHeap::sweep() {
     state() = State::IDLE;
 }
 void GcHeap::collect() {
+    if constexpr (is_debug) {
+        std::println("starting full collection");
+    }
     auto object_list = object_list_.get();
     auto ptr = object_list.head;
     while (ptr) {
@@ -140,5 +143,8 @@ void GcHeap::collect() {
         mark_some(10);
     }
     sweep();
+    if constexpr (is_debug) {
+        std::println("full collection done");
+    }
 }
 }// namespace gc

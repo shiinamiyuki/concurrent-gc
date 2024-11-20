@@ -18,56 +18,6 @@ struct Foo : gc::Traceable {
     Foo() : bar(this), s(this), foo(this) {}
     GC_CLASS(bar, s, foo)
 };
-// void test_wb() {
-//     gc::GcHeap::init();
-//     // std::println("hello");
-//     auto &heap = gc::get_heap();
-//     gc::Local<Foo> foo1 = gc::Local<Foo>::make();
-
-//     foo1->bar = gc::Local<Bar>::make(1234);
-//     foo1->s = gc::Local<gc::Adaptor<std::string>>::make("hello");
-//     // heap.mark_some();
-//     //    std::fflush(stdout);
-//     // printf("foo1->bar = %d\n", foo1->bar->val);
-//     gc::Local<Foo> foo2 = gc::Local<Foo>::make();
-//     foo1->foo = foo2;
-//     foo2->bar = gc::Local<Bar>::make(5678);
-//     while (heap.mark_some()) {}
-//     heap.mark_some();
-//     heap.mark_some();
-//     heap.mark_some();
-//     heap.mark_some();
-//     GC_ASSERT(foo1.gc_object_container() == foo1->bar.parent(), "foo1 and bar should be in the same container");
-//     printf("is black = %d\n", foo1->bar.parent()->color() == gc::color::BLACK);
-//     printf("is white = %d\n", foo2->bar.gc_object_container()->color() == gc::color::WHITE);
-//     foo1->bar = foo2->bar;
-//     while (heap.mark_some()) {}
-// }
-// void test_simple() {
-//     auto &heap = gc::get_heap();
-//     gc::Local<Foo> foo;
-//     {
-//         // auto bar = gc::make_gc_ptr<Bar>(1234);
-//         // auto foo = gc::Local{gc::make_gc_ptr<Foo>()};
-//         // foo->bar = bar;
-//         // gc::get_heap().collect();
-//         // std::print("{}\n", bar->val);
-//         {
-//             auto bar = gc::Local<Bar>::make(1234);
-//             foo = gc::Local<Foo>::make();
-//             foo->s = gc::Local<gc::Adaptor<std::string>>::make("hello");
-//             foo->bar = bar;
-//         }
-//         while (heap.mark_some()) {}
-//         // gc::get_heap().collect();
-//         std::print("{}\n", foo->bar->val);
-//         while (heap.mark_some()) {}
-//         foo->bar = nullptr;
-//         std::print("foo->s = {}", static_cast<std::string &>(*foo->s));
-//     }
-//     heap.collect();
-//     std::print("foo still alive\n");
-// }
 
 void test_random() {
     gc::GcOption option{};
@@ -120,6 +70,60 @@ auto find_all_nodes(gc::GcPtr<Node<T>> root) {
     dfs(root);
     return nodes;
 }
+
+struct WBTestNode : public gc::Traceable {
+    int val{};
+    gc::Member<WBTestNode> left;
+    gc::Member<WBTestNode> right;
+    WBTestNode() : left(this), right(this) {}
+    GC_CLASS(left, right)
+};
+void test_wb() {
+    gc::GcOption option{};
+    option.max_heap_size = 1024 * 180;
+    option._full_debug = true;
+    option.mode = gc::GcMode::INCREMENTAL;
+    gc::GcHeap::init(option);
+    for (auto j = 0; j < 10; j++) {
+        std::vector<gc::Local<WBTestNode>> roots;
+        for (int i = 0; i < 100; i++) {
+            auto node = gc::Local<WBTestNode>::make();
+            node->val = i;
+            auto x = gc::Local<WBTestNode>::make();
+            auto y = gc::Local<WBTestNode>::make();
+            x->val = 2 * i;
+            y->val = 2 * i + 1;
+            node->left = x;
+            node->right = y;
+            auto z = gc::Local<WBTestNode>::make();
+            z->val = 2 * i + 2;
+            y->left = z;
+            roots.push_back(node);
+        }
+        gc::get_heap().collect();
+        gc::get_heap().scan_roots();
+        GC_ASSERT(gc::get_heap().mark_some(1), "should mark some");
+        for (auto &root : roots) {
+            auto &x = root->left;
+            auto &y = root->right;
+            auto &z = y->left;
+            std::printf("root->color = %d\n", root->color());
+            std::printf("x->color = %d\n", x->color());
+            std::printf("y->color = %d\n", y->color());
+            std::printf("z->color = %d\n", z->color());
+            x->left = z;
+            y->left = nullptr;
+        }
+        while(gc::get_heap().mark_some(1)) {}
+        gc::get_heap().sweep();
+        for (auto &root : roots) {
+            auto &x = root->left;
+            auto &z = x->left;
+            std::printf("z->val = %d\n", z->val);
+        }
+    }
+}
+
 void test_random_graph() {
     gc::GcOption option{};
     option.max_heap_size = 1024 * 64;
@@ -145,7 +149,7 @@ void test_random_graph2() {
     gc::GcOption option{};
     option.mode = gc::GcMode::INCREMENTAL;
     option.max_heap_size = 1024 * 64;
-    option._full_debug = true;
+    option._full_debug = false;
     gc::GcHeap::init(option);
     std::random_device rd;
     std::uniform_int_distribution<int> gen;
@@ -210,6 +214,6 @@ void test_random_graph2() {
 //     // }
 // }
 int main() {
-    test_random_graph2();
+    test_wb();
     return 0;
 }

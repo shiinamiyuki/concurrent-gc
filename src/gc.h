@@ -274,6 +274,21 @@ struct GcOption {
     double gc_threshold = 0.5;// when should a gc be triggered
     bool _full_debug = false;
 };
+// namespace detail {
+// struct new_but_no_delete_memory_resouce : std::pmr::memory_resource {
+//     std::pmr::memory_resource *inner;
+//     new_but_no_delete_memory_resouce() : inner(std::pmr::new_delete_resource()) {}
+//     void *do_allocate(std::size_t bytes, std::size_t alignment) override {
+//         return inner->allocate(bytes, alignment);
+//     }
+//     void do_deallocate(void *p, std::size_t bytes, std::size_t alignment) override {
+//         // do nothing
+//     }
+//     bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
+//         return this == &other;
+//     }
+// };
+// }// namespace detail
 class GcHeap {
     friend struct TracingContext;
     template<class T>
@@ -755,7 +770,7 @@ class Member {
             if (heap.need_write_barrier()) [[likely]] {
                 if (parent_->color() == color::BLACK) {
                     if constexpr (is_debug) {
-                        std::printf("write barrier\n");
+                        std::printf("write barrier, color=%d\n", ptr->color());
                     }
                     heap.shade(ptr.gc_object_container());
                 }
@@ -870,13 +885,13 @@ class GcVector : public Traceable {
     }
     void ensure_size(size_t new_size) {
         if (data_ == nullptr) {
-            data_ = alloc(new_size);
+            data_ = alloc(std::max(16ull, new_size));
             return;
         }
         if (new_size <= data_->size()) {
             return;
         }
-        auto new_capacity = std::max(data_->size() * 2, new_size);
+        auto new_capacity = std::max(16ull, std::max(data_->size() * 2, new_size));
         Local<GcArray<T>> new_data = alloc(new_capacity);
         for (size_t i = 0; i < data_->size(); i++) {
             (*new_data)[i] = (*data_)[i];
@@ -885,7 +900,7 @@ class GcVector : public Traceable {
     }
 public:
     size_t capacity() const {
-        return data_.size();
+        return data_->size();
     }
     GcVector() : data_(this), size_(0) {}
     void push_back(GcPtr<T> value) {
@@ -902,7 +917,12 @@ public:
         return (*data_)[idx];
     }
     void pop_back() {
+        at(size_ - 1) = nullptr;
         size_--;
+    }
+    Member<T> &back() {
+        GC_ASSERT(size_ > 0, "Size should be greater than 0");
+        return (*data_)[size_ - 1];
     }
     size_t size() const {
         return size_;
