@@ -5,6 +5,7 @@
 #include <random>
 #include <array>
 #include <numeric>
+#include <chrono>
 struct Bar : gc::Traceable {
     int val;
     explicit Bar(int val = 0) : val(val) {}
@@ -114,7 +115,7 @@ void test_wb() {
             x->left = z;
             y->left = nullptr;
         }
-        while(gc::get_heap().mark_some(1)) {}
+        while (gc::get_heap().mark_some(1)) {}
         gc::get_heap().sweep();
         for (auto &root : roots) {
             auto &x = root->left;
@@ -147,13 +148,14 @@ void test_random_graph() {
 }
 void test_random_graph2() {
     gc::GcOption option{};
-    option.mode = gc::GcMode::CONCURRENT;
+    option.mode = gc::GcMode::STOP_THE_WORLD;
     option.max_heap_size = 1024 * 128;
     option._full_debug = true;
     gc::GcHeap::init(option);
     std::random_device rd;
     std::uniform_int_distribution<int> gen;
-    for (auto j = 0; j < 20; j++) {
+    for (auto j = 0; j < 50; j++) {
+        auto time = std::chrono::high_resolution_clock::now();
         gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
         for (int i = 0; i < 100; i++) {
             auto node = gc::Local<Node<int>>::make();
@@ -185,7 +187,55 @@ void test_random_graph2() {
             return acc + node->val;
         });
         printf("sum = %d\n", sum);
+        auto elapsed = std::chrono::high_resolution_clock::now() - time;
+        printf("elapsed = %lldus\n", std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
     }
+}
+struct StatsTracker {
+    double mean = 0;
+    double max = 0;
+    double min = std::numeric_limits<double>::max();
+    double m2 = 0;
+    size_t count = 0;
+    void update(double x) {
+        max = std::max(max, x);
+        min = std::min(min, x);
+        count++;
+        double delta = x - mean;
+        mean += delta / count;
+        double delta2 = x - mean;
+        m2 += delta * delta2;
+    }
+    double variance() const {
+        return m2 / count;
+    }
+};
+void bench_allocation() {
+    gc::GcOption option{};
+    option.mode = gc::GcMode::STOP_THE_WORLD;
+    option.max_heap_size = 1024 * 64;
+    gc::GcHeap::init(option);
+    StatsTracker tracker;
+    auto f = [&] {
+        for (auto j = 0; j < 400; j++) {
+            gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
+            auto time = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < 20; i++) {
+                auto node = gc::Local<Node<int>>::make();
+                node->val = i;
+                root->children->push_back(node);
+            }
+            auto elapsed = std::chrono::high_resolution_clock::now() - time;
+            tracker.update(static_cast<double>(elapsed.count()) * 1e-3);
+        }
+    };
+    f();
+    tracker = StatsTracker{};
+    f();
+    printf("mean = %f\n", tracker.mean);
+    printf("max = %f\n", tracker.max);
+    printf("min = %f\n", tracker.min);
+    printf("variance = %f\n", tracker.variance());
 }
 // void test_random() {
 //     gc::GcOption option{};
@@ -214,6 +264,6 @@ void test_random_graph2() {
 //     // }
 // }
 int main() {
-    test_random_graph2();
+    bench_allocation();
     return 0;
 }
