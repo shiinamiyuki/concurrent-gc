@@ -34,7 +34,7 @@ void GcHeap::signal_collection() {
     if constexpr (is_debug) {
         std::printf("Signaling collection\n");
     }
-    pool_.get().concurrent_state = State::MARKING;
+    pool_.get().concurrent_state = ConcurrentState::REQUESTED;
 }
 void GcHeap::do_concurrent(size_t inc_size) {
     pool_.with([&](auto &pool, auto *lock) {
@@ -44,14 +44,27 @@ void GcHeap::do_concurrent(size_t inc_size) {
         auto threshold = [&]() -> bool {
             return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
         };
-        while (pool.concurrent_state == State::SWEEPING) {
+        while (pool.concurrent_state == ConcurrentState::SWEEPING) {
             lock->unlock();
             std::this_thread::yield();
             lock->lock();
         }
         if (!is_mem_available() || threshold()) {
-            signal_collection();
-            while (pool.concurrent_state == State::SWEEPING) {
+            if (pool.concurrent_state == ConcurrentState::IDLE) {
+                signal_collection();
+                while (pool.concurrent_state == ConcurrentState::REQUESTED) {
+                    lock->unlock();
+                    std::this_thread::yield();
+                    lock->lock();
+                }
+            } else {
+                while (pool.concurrent_state != ConcurrentState::IDLE) {
+                    lock->unlock();
+                    std::this_thread::yield();
+                    lock->lock();
+                }
+            }
+            while (pool.concurrent_state == ConcurrentState::SWEEPING) {
                 lock->unlock();
                 std::this_thread::yield();
                 lock->lock();
@@ -63,7 +76,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
 void GcHeap::concurrent_collector() {
     while (!stop_collector_.load(std::memory_order_relaxed)) {
         pool_.with([&](Pool &pool, auto *lock) {
-            while (pool.concurrent_state == State::IDLE && !stop_collector_.load(std::memory_order_relaxed)) {
+            while (pool.concurrent_state == ConcurrentState::IDLE && !stop_collector_.load(std::memory_order_relaxed)) {
                 lock->unlock();
                 std::this_thread::yield();
                 lock->lock();
@@ -71,7 +84,8 @@ void GcHeap::concurrent_collector() {
             if (stop_collector_.load(std::memory_order_relaxed)) {
                 return;
             }
-            GC_ASSERT(pool.concurrent_state == State::MARKING, "State should be marking");
+            GC_ASSERT(pool.concurrent_state == ConcurrentState::REQUESTED, "Mutator should request collection");
+            pool.concurrent_state = ConcurrentState::MARKING;
             if constexpr (is_debug) {
                 std::printf("Starting concurrent collection\n");
             }
@@ -81,14 +95,18 @@ void GcHeap::concurrent_collector() {
         }
 
         scan_roots();
+        // marking only acquire lock on the work list
+        // but not the pool. at this time, the mutator can still allocate and push stuff to the pool
+        // what do we do?
         while (mark_some(10)) {}
         pool_.with([&](Pool &pool, auto *lock) {
-            GC_ASSERT(pool.concurrent_state == State::MARKING, "State should be marking");
-            pool.concurrent_state = State::SWEEPING;
+            GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
+            pool.concurrent_state = ConcurrentState::SWEEPING;
         });
+        while (mark_some(10)) {}
         sweep();
         pool_.with([&](Pool &pool, auto *lock) {
-            pool.concurrent_state = State::IDLE;
+            pool.concurrent_state = ConcurrentState::IDLE;
             if constexpr (is_debug) {
                 std::printf("Concurrent collection done\n");
             }

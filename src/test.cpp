@@ -148,7 +148,7 @@ void test_random_graph() {
 }
 void test_random_graph2() {
     gc::GcOption option{};
-    option.mode = gc::GcMode::STOP_THE_WORLD;
+    option.mode = gc::GcMode::CONCURRENT;
     option.max_heap_size = 1024 * 128;
     option._full_debug = true;
     gc::GcHeap::init(option);
@@ -264,6 +264,6 @@ void bench_allocation() {
 //     // }
 // }
 int main() {
-    bench_allocation();
+    test_random_graph2();
     return 0;
 }

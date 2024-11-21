@@ -26,7 +26,7 @@
     } while (0)
 namespace gc {
 #ifdef DEBUG
-constexpr bool is_debug = true;
+constexpr bool is_debug = false;
 #else
 constexpr bool is_debug = false;
 #endif
@@ -51,23 +51,27 @@ inline void pause_thread() {
     std::this_thread::yield();
 #endif
 }
-// struct spin_lock {// https://rigtorp.se/spinlock/
-//     std::atomic<bool> lock_ = false;
-//     void lock() {
-//         for (;;) {
-//             if (!lock_.exchange(true, std::memory_order_acquire)) {
-//                 break;
-//             }
-//             while (lock_.load(std::memory_order_relaxed)) {
-//                 pause_thread();
-//             }
-//         }
-//     }
-//     void unlock() {
-//         lock_.store(false, std::memory_order_release);
-//     }
-// };
+#ifdef DEBUG
+// mutex helps catching reentrant lock
 using spin_lock = std::mutex;
+#else
+struct spin_lock {// https://rigtorp.se/spinlock/
+    std::atomic<bool> lock_ = false;
+    void lock() {
+        for (;;) {
+            if (!lock_.exchange(true, std::memory_order_acquire)) {
+                break;
+            }
+            while (lock_.load(std::memory_order_relaxed)) {
+                pause_thread();
+            }
+        }
+    }
+    void unlock() {
+        lock_.store(false, std::memory_order_release);
+    }
+};
+#endif
 template<size_t Idx, typename I>
 constexpr bool get_bit(I bitmap) {
     return (bitmap >> Idx) & 1;
@@ -303,11 +307,17 @@ class GcHeap {
         MARKING,
         SWEEPING
     };
+    enum class ConcurrentState {
+        IDLE,
+        REQUESTED,
+        MARKING,
+        SWEEPING
+    };
     struct Pool {
         size_t allocation_size_ = 0;
         std::unique_ptr<std::pmr::memory_resource> inner;
         std::optional<std::pmr::polymorphic_allocator<void>> alloc_;
-        State concurrent_state = State::IDLE;
+        ConcurrentState concurrent_state = ConcurrentState::IDLE;
         Pool(GcOption option) {
             if (option._full_debug) {
                 inner = std::make_unique<std::pmr::monotonic_buffer_resource>();
@@ -352,7 +362,7 @@ class GcHeap {
             pool.alloc_->deallocate_bytes(ptr, size, align);
         });
     }
-    /// @brief `shade` itself do not acquire the lock on work_list
+    /// @brief `shade` it self do not acquire the lock on work_list
     /// @param ptr
     void shade(const GcObjectContainer *ptr);
     /// @brief scan a gray object and possibly add its children to the work list
@@ -488,7 +498,7 @@ public:
 
         auto ptr = pool_.with([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
-                GC_ASSERT(pool.concurrent_state != State::SWEEPING, "State should not be sweeping");
+                GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
             }
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
             auto ptr = pool.alloc_->allocate_object<T>(1);
@@ -510,14 +520,23 @@ public:
                 shade(ptr);
             });
         }
-
-        object_list_.with([&](auto &list, auto *lock) {
-            if (list.head == nullptr) {
-                list.head = ptr;
-            } else {
-                ptr->next_ = list.head;
-                list.head = ptr;
+        pool_.with([&](Pool &pool, auto *lock) {
+            while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                lock->unlock();
+                std::this_thread::yield();
+                lock->lock();
             }
+            // possible sync issue here
+            // while allocation only happens when collector is not in sweeping
+            // at this line, the collector might just start sweeping
+            object_list_.with([&](auto &list, auto *lock) {
+                if (list.head == nullptr) {
+                    list.head = ptr;
+                } else {
+                    ptr->next_ = list.head;
+                    list.head = ptr;
+                }
+            });
         });
         return ptr;
     }
