@@ -7,12 +7,12 @@
 #include <unordered_set>
 #include <stacktrace>
 #include <iostream>
-#include <print>
 #include <optional>
 #include <thread>
 #include <emmintrin.h>
 #include <mutex>
-
+#include <list>
+static_assert(sizeof(size_t) == 8, "64-bit only");
 #define GC_ASSERT(x, msg)                                    \
     do {                                                     \
         if (!(x)) [[unlikely]] {                             \
@@ -449,7 +449,7 @@ class GcHeap {
         GC_ASSERT(work_list.get().empty(), "Work list should be empty");
         bool threshold_condition = pool_.get().allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
         if constexpr (is_debug) {
-            std::printf("allocation_size_ = %lld, max_heap_size_ = %lld, inc_size = %lld\n", pool_.get().allocation_size_, max_heap_size_, inc_size);
+            std::printf("allocation_size_ = %llu, max_heap_size_ = %llu, inc_size = %llu\n", pool_.get().allocation_size_, max_heap_size_, inc_size);
             std::printf("threshold_condition = %d\n", threshold_condition);
         }
         if (pool_.get().allocation_size_ + inc_size > max_heap_size_) {
@@ -919,7 +919,7 @@ public:
     GcArray(size_t n) : data_(nullptr), size_(n) {
         auto &heap = get_heap();
         auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource());
-        data_ = alloc.allocate_object<Member<T>>(n);
+        data_ = alloc.template allocate_object<Member<T>>(n);
         for (size_t i = 0; i < n; i++) {
             new (data_ + i) Member<T>(this);
         }
@@ -966,13 +966,13 @@ class GcVector : public Traceable {
     }
     void ensure_size(size_t new_size) {
         if (data_ == nullptr) {
-            data_ = alloc(std::max(16ull, new_size));
+            data_ = alloc(std::max<size_t>(16, new_size));
             return;
         }
         if (new_size <= data_->size()) {
             return;
         }
-        auto new_capacity = std::max(16ull, std::max(data_->size() * 2, new_size));
+        auto new_capacity = std::max<size_t>(16ull, std::max(data_->size() * 2, new_size));
         Local<GcArray<T>> new_data = alloc(new_capacity);
         for (size_t i = 0; i < data_->size(); i++) {
             (*new_data)[i] = (*data_)[i];

@@ -1,7 +1,6 @@
 
 #include "gc.h"
 #include "rc.h"
-#include <print>
 #include <random>
 #include <array>
 #include <numeric>
@@ -242,8 +241,8 @@ void bench_allocation() {
         printf("variance = %f\n", tracker.variance());
         gc::GcHeap::destroy();
     };
-    bench(gc::GcMode::STOP_THE_WORLD);
-    bench(gc::GcMode::INCREMENTAL);
+    // bench(gc::GcMode::STOP_THE_WORLD);
+    // bench(gc::GcMode::INCREMENTAL);
     bench(gc::GcMode::CONCURRENT);
 }
 // void test_random() {

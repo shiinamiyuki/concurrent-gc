@@ -203,7 +203,7 @@ void GcHeap::sweep() {
     }
     object_list_.with([&](auto &list, auto *lock) {
         if constexpr (is_debug) {
-            std::println("starting sweep");
+            std::printf("starting sweep\n");
             auto obj_cnt = 0;
             auto root_cnt = 0;
             auto ptr = list.head;
@@ -249,7 +249,7 @@ void GcHeap::sweep() {
 }
 void GcHeap::collect() {
     if constexpr (is_debug) {
-        std::println("starting full collection");
+        std::printf("starting full collection\n");
     }
     auto object_list = object_list_.get();
     auto ptr = object_list.head;
@@ -267,7 +267,7 @@ void GcHeap::collect() {
     }
     sweep();
     if constexpr (is_debug) {
-        std::println("full collection done");
+        std::printf("full collection done\n");
     }
 }
 }// namespace gc
