@@ -26,7 +26,7 @@
     } while (0)
 namespace gc {
 #ifdef DEBUG
-constexpr bool is_debug = false;
+constexpr bool is_debug = true;
 #else
 constexpr bool is_debug = false;
 #endif
@@ -89,12 +89,13 @@ concept Lockable = requires(T lock) {
     lock.lock();
     lock.unlock();
 };
+  struct emplace_t {};
 template<Lockable Lock, class T>
 class LockProtected {
     T data;
     std::optional<Lock> lock;
 public:
-    struct emplace_t {};
+  
     LockProtected() = delete;
     LockProtected(bool enable) : data() {
         if (enable) {
@@ -374,6 +375,7 @@ class GcHeap {
         }
         if constexpr (is_debug) {
             std::printf("scanning %p\n", static_cast<const void *>(ptr));
+            std::fflush(stdout);
         }
         if (mode() != GcMode::CONCURRENT) {
             GC_ASSERT(ptr->color() == color::GRAY || ptr->is_root(), "Object should be gray");
@@ -494,16 +496,29 @@ public:
     template<class T, class... Args>
         requires std::constructible_from<T, Args...>
     auto *_new_object(Args &&...args) {
+        if constexpr (is_debug) {
+            std::printf("Want to allocate %lld bytes\n", sizeof(T));
+            std::fflush(stdout);
+        }
         prepare_allocation(sizeof(T));
 
         auto ptr = pool_.with([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
-                GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
+                // GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
+                while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                    if constexpr (is_debug) {
+                        std::printf("Waiting for sweeping\n");
+                    }
+                    lock->unlock();
+                    std::this_thread::yield();
+                    lock->lock();
+                }
             }
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
             auto ptr = pool.alloc_->allocate_object<T>(1);
             if constexpr (is_debug) {
                 std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_, max_heap_size_);
+                std::fflush(stdout);
             }
 
             pool.allocation_size_ += sizeof(T);
@@ -513,18 +528,18 @@ public:
         GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
         ptr->set_alive(true);
 
-        if (mode() != GcMode::STOP_THE_WORLD) {
-            // this is necessary, you can't just color it black since the above line `T(std::forward<Args>(args)...);`
-            // invokes the constructor and might setup some member pointers
-            work_list.with([&](auto &work_list, auto *lock) {
-                shade(ptr);
-            });
-        }
         pool_.with([&](Pool &pool, auto *lock) {
             while (pool.concurrent_state == ConcurrentState::SWEEPING) {
                 lock->unlock();
                 std::this_thread::yield();
                 lock->lock();
+            }
+            if (mode() != GcMode::STOP_THE_WORLD) {
+                // this is necessary, you can't just color it black since the above line `T(std::forward<Args>(args)...);`
+                // invokes the constructor and might setup some member pointers
+                work_list.with([&](auto &work_list, auto *lock) {
+                    shade(ptr);
+                });
             }
             // possible sync issue here
             // while allocation only happens when collector is not in sweeping

@@ -24,7 +24,7 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
     : mode_(option.mode),
       max_heap_size_(option.max_heap_size),
       gc_threshold_(option.gc_threshold),
-      pool_(detail::LockProtected<std::recursive_mutex, Pool>::emplace_t{}, option.mode == GcMode::CONCURRENT, option),
+      pool_(detail::emplace_t{}, option.mode == GcMode::CONCURRENT, option),
       object_list_(ObjectList{}, option.mode == GcMode::CONCURRENT),
       root_set_(RootSet{}, option.mode == GcMode::CONCURRENT),
       work_list(WorkList{}, option.mode == GcMode::CONCURRENT),
@@ -45,6 +45,9 @@ void GcHeap::do_concurrent(size_t inc_size) {
             return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
         };
         while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+            if constexpr (is_debug) {
+                std::printf("Waiting for sweeping\n");
+            }
             lock->unlock();
             std::this_thread::yield();
             lock->lock();
@@ -52,23 +55,29 @@ void GcHeap::do_concurrent(size_t inc_size) {
         if (!is_mem_available() || threshold()) {
             if (pool.concurrent_state == ConcurrentState::IDLE) {
                 signal_collection();
-                while (pool.concurrent_state == ConcurrentState::REQUESTED) {
-                    lock->unlock();
-                    std::this_thread::yield();
-                    lock->lock();
+            }
+            if (!is_mem_available()) {
+                GC_ASSERT(pool.concurrent_state != ConcurrentState::IDLE, "State should not be idle");
+                if (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
+                    while (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
+                        if constexpr (is_debug) {
+                            std::printf("Memory not enough, waiting for collection\n");
+                        }
+                        lock->unlock();
+                        std::this_thread::yield();
+                        lock->lock();
+                    }
                 }
-            } else {
-                while (pool.concurrent_state != ConcurrentState::IDLE) {
+                while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                    if constexpr (is_debug) {
+                        std::printf("Waiting for sweeping\n");
+                    }
                     lock->unlock();
                     std::this_thread::yield();
                     lock->lock();
                 }
             }
-            while (pool.concurrent_state == ConcurrentState::SWEEPING) {
-                lock->unlock();
-                std::this_thread::yield();
-                lock->lock();
-            }
+
             GC_ASSERT(is_mem_available(), "Out of memory");
         }
     });
@@ -103,9 +112,13 @@ void GcHeap::concurrent_collector() {
             GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
             pool.concurrent_state = ConcurrentState::SWEEPING;
         });
-        while (mark_some(10)) {}
-        sweep();
+        if constexpr (is_debug) {
+            std::printf("Concurrent sweeping\n");
+        }
+
         pool_.with([&](Pool &pool, auto *lock) {
+            while (mark_some(10)) {}
+            sweep();
             pool.concurrent_state = ConcurrentState::IDLE;
             if constexpr (is_debug) {
                 std::printf("Concurrent collection done\n");
@@ -152,6 +165,7 @@ void GcHeap::scan_roots() {
     root_set_.with([&](RootSet &rs, auto *lock) {
         if constexpr (is_debug) {
             std::printf("scanning %lld roots\n", rs.size());
+            std::fflush(stdout);
         }
         for (auto root : rs) {
             // if (mode() != GcMode::CONCURRENT) {
@@ -161,6 +175,7 @@ void GcHeap::scan_roots() {
             GC_ASSERT(root->is_root(), "Root should be root");
             if constexpr (is_debug) {
                 std::printf("scanning root %p\n", static_cast<const void *>(root));
+                std::fflush(stdout);
             }
             work_list.with([&](auto &wl, auto *lock) {
                 scan(root);
