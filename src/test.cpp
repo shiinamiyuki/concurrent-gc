@@ -211,31 +211,40 @@ struct StatsTracker {
     }
 };
 void bench_allocation() {
-    gc::GcOption option{};
-    option.mode = gc::GcMode::STOP_THE_WORLD;
-    option.max_heap_size = 1024 * 64;
-    gc::GcHeap::init(option);
-    StatsTracker tracker;
-    auto f = [&] {
-        for (auto j = 0; j < 400; j++) {
-            gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
-            auto time = std::chrono::high_resolution_clock::now();
-            for (int i = 0; i < 20; i++) {
-                auto node = gc::Local<Node<int>>::make();
-                node->val = i;
-                root->children->push_back(node);
+
+    auto bench = [](gc::GcMode mode) {
+        gc::GcOption option{};
+        option.mode = mode;
+        option.max_heap_size = 1024 * 64;
+        gc::GcHeap::init(option);
+        StatsTracker tracker;
+        auto f = [&] {
+            for (auto j = 0; j < 400; j++) {
+                gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
+                auto time = std::chrono::high_resolution_clock::now();
+                for (int i = 0; i < 20; i++) {
+                    auto node = gc::Local<Node<int>>::make();
+                    node->val = i;
+                    root->children->push_back(node);
+                }
+                auto elapsed = std::chrono::high_resolution_clock::now() - time;
+                tracker.update(static_cast<double>(elapsed.count()) * 1e-3);
+                // std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            auto elapsed = std::chrono::high_resolution_clock::now() - time;
-            tracker.update(static_cast<double>(elapsed.count()) * 1e-3);
-        }
+        };
+        printf("benchmarking %s\n", gc::to_string(mode));
+        f();
+        tracker = StatsTracker{};
+        f();
+        printf("mean = %f\n", tracker.mean);
+        printf("max = %f\n", tracker.max);
+        printf("min = %f\n", tracker.min);
+        printf("variance = %f\n", tracker.variance());
+        gc::GcHeap::destroy();
     };
-    f();
-    tracker = StatsTracker{};
-    f();
-    printf("mean = %f\n", tracker.mean);
-    printf("max = %f\n", tracker.max);
-    printf("min = %f\n", tracker.min);
-    printf("variance = %f\n", tracker.variance());
+    bench(gc::GcMode::STOP_THE_WORLD);
+    bench(gc::GcMode::INCREMENTAL);
+    bench(gc::GcMode::CONCURRENT);
 }
 // void test_random() {
 //     gc::GcOption option{};
@@ -264,6 +273,6 @@ void bench_allocation() {
 //     // }
 // }
 int main() {
-    test_random_graph2();
+    bench_allocation();
     return 0;
 }

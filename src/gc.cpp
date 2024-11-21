@@ -52,34 +52,42 @@ void GcHeap::do_concurrent(size_t inc_size) {
             std::this_thread::yield();
             lock->lock();
         }
-        if (!is_mem_available() || threshold()) {
-            if (pool.concurrent_state == ConcurrentState::IDLE) {
-                signal_collection();
-            }
-            if (!is_mem_available()) {
-                GC_ASSERT(pool.concurrent_state != ConcurrentState::IDLE, "State should not be idle");
-                if (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
-                    while (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
+        // in concurrent mode, the mutator might allocate too fast such that a single sweep is not enough
+        // this is partly due to newly allocated objects are only collected in the next sweep
+        auto n_retry = 2;
+        for (auto r = 0; r < n_retry; r++) {
+            if (!is_mem_available() || threshold()) {
+                if (pool.concurrent_state == ConcurrentState::IDLE) {
+                    signal_collection();
+                }
+
+                if (!is_mem_available()) {
+                    GC_ASSERT(pool.concurrent_state != ConcurrentState::IDLE, "State should not be idle");
+                    if (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
+                        while (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
+                            if constexpr (is_debug) {
+                                std::printf("Memory not enough, waiting for collection\n");
+                            }
+                            lock->unlock();
+                            std::this_thread::yield();
+                            lock->lock();
+                        }
+                    }
+                    while (pool.concurrent_state == ConcurrentState::SWEEPING) {
                         if constexpr (is_debug) {
-                            std::printf("Memory not enough, waiting for collection\n");
+                            std::printf("Waiting for sweeping\n");
                         }
                         lock->unlock();
                         std::this_thread::yield();
                         lock->lock();
                     }
                 }
-                while (pool.concurrent_state == ConcurrentState::SWEEPING) {
-                    if constexpr (is_debug) {
-                        std::printf("Waiting for sweeping\n");
-                    }
-                    lock->unlock();
-                    std::this_thread::yield();
-                    lock->lock();
+                if (is_mem_available()) {
+                    return;
                 }
             }
-
-            GC_ASSERT(is_mem_available(), "Out of memory");
         }
+        GC_ASSERT(is_mem_available(), "Out of memory");
     });
 }
 void GcHeap::concurrent_collector() {
@@ -136,6 +144,12 @@ void GcHeap::init(GcOption option) {
         heap->collector_thread_.emplace([&] {
             heap->concurrent_collector();
         });
+    }
+}
+void GcHeap::destroy() {
+    if (heap) {
+        heap->stop();
+        heap.reset();
     }
 }
 GcHeap &get_heap() {

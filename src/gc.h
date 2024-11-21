@@ -51,10 +51,10 @@ inline void pause_thread() {
     std::this_thread::yield();
 #endif
 }
-#ifdef DEBUG
-// mutex helps catching reentrant lock
-using spin_lock = std::mutex;
-#else
+// #ifdef DEBUG
+// // mutex helps catching reentrant lock
+// using spin_lock = std::mutex;
+// #else
 struct spin_lock {// https://rigtorp.se/spinlock/
     std::atomic<bool> lock_ = false;
     void lock() {
@@ -71,7 +71,34 @@ struct spin_lock {// https://rigtorp.se/spinlock/
         lock_.store(false, std::memory_order_release);
     }
 };
-#endif
+// #endif
+struct recursive_spinlock {
+private:
+    spin_lock mutex;
+    std::thread::id owner;
+    size_t count = 0;
+public:
+    void lock() {
+        auto id = std::this_thread::get_id();
+        if (id == owner) {
+            count++;
+            return;
+        }
+        mutex.lock();
+        GC_ASSERT(count == 0, "Reentrant lock");
+
+        owner = id;
+        count = 1;
+    }
+    void unlock() {
+        GC_ASSERT(count > 0, "Unlocking unlocked lock");
+        count--;
+        if (count == 0) {
+            owner = {};
+            mutex.unlock();
+        }
+    }
+};
 template<size_t Idx, typename I>
 constexpr bool get_bit(I bitmap) {
     return (bitmap >> Idx) & 1;
@@ -89,13 +116,13 @@ concept Lockable = requires(T lock) {
     lock.lock();
     lock.unlock();
 };
-  struct emplace_t {};
+struct emplace_t {};
 template<Lockable Lock, class T>
 class LockProtected {
     T data;
     std::optional<Lock> lock;
 public:
-  
+
     LockProtected() = delete;
     LockProtected(bool enable) : data() {
         if (enable) {
@@ -257,6 +284,17 @@ enum class GcMode : uint8_t {
     INCREMENTAL,
     CONCURRENT
 };
+inline const char *to_string(GcMode mode) {
+    switch (mode) {
+        case GcMode::STOP_THE_WORLD:
+            return "STOP_THE_WORLD";
+        case GcMode::INCREMENTAL:
+            return "INCREMENTAL";
+        case GcMode::CONCURRENT:
+            return "CONCURRENT";
+    }
+    return "UNKNOWN";
+}
 struct WorkList {
     std::deque<const GcObjectContainer *> list;
     void append(const GcObjectContainer *ptr) {
@@ -337,7 +375,7 @@ class GcHeap {
 
     // lock order: object_list -> pool
 
-    detail::LockProtected<std::recursive_mutex, Pool> pool_;
+    detail::LockProtected<detail::recursive_spinlock, Pool> pool_;
 
     detail::LockProtected<detail::spin_lock, ObjectList> object_list_;
     detail::LockProtected<detail::spin_lock, RootSet> root_set_;
@@ -493,6 +531,7 @@ public:
         return mode_;
     }
     static void init(GcOption option = {});
+    static void destroy();
     template<class T, class... Args>
         requires std::constructible_from<T, Args...>
     auto *_new_object(Args &&...args) {
@@ -566,12 +605,10 @@ public:
         work_list.get().append(ptr);
     }
     ~GcHeap() {
-        stop_collector_ = true;
-        if (collector_thread_.has_value()) {
-            collector_thread_->join();
+        if (stop_collector_) {
+            return;
         }
-        collect();
-        GC_ASSERT(object_list_.get().head == nullptr, "Memory leak detected");
+        stop();
     }
     bool need_write_barrier() {
         if (mode_ == GcMode::STOP_THE_WORLD) {
@@ -581,6 +618,15 @@ public:
         }
         // TODO: what about concurrent mode?
         return state() == State::MARKING;
+    }
+private:
+    void stop() {
+        stop_collector_ = true;
+        if (collector_thread_.has_value()) {
+            collector_thread_->join();
+        }
+        collect();
+        GC_ASSERT(object_list_.get().head == nullptr, "Memory leak detected");
     }
 };
 GcHeap &get_heap();
