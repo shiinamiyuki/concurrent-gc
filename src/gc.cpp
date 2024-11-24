@@ -49,7 +49,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
                 std::printf("Waiting for sweeping\n");
             }
             lock->unlock();
-            std::this_thread::yield();
+            detail::pause_thread();
             lock->lock();
         }
         // in concurrent mode, the mutator might allocate too fast such that a single sweep is not enough
@@ -69,7 +69,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
                                 std::printf("Memory not enough, waiting for collection\n");
                             }
                             lock->unlock();
-                            std::this_thread::yield();
+                            detail::pause_thread();
                             lock->lock();
                         }
                     }
@@ -78,7 +78,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
                             std::printf("Waiting for sweeping\n");
                         }
                         lock->unlock();
-                        std::this_thread::yield();
+                        detail::pause_thread();
                         lock->lock();
                     }
                 }
@@ -95,7 +95,7 @@ void GcHeap::concurrent_collector() {
         pool_.with([&](Pool &pool, auto *lock) {
             while (pool.concurrent_state == ConcurrentState::IDLE && !stop_collector_.load(std::memory_order_relaxed)) {
                 lock->unlock();
-                std::this_thread::yield();
+                detail::pause_thread();
                 lock->lock();
             }
             if (stop_collector_.load(std::memory_order_relaxed)) {

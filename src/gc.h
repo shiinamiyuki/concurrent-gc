@@ -549,7 +549,7 @@ public:
                         std::printf("Waiting for sweeping\n");
                     }
                     lock->unlock();
-                    std::this_thread::yield();
+                    detail::pause_thread();
                     lock->lock();
                 }
             }
@@ -570,7 +570,7 @@ public:
         pool_.with([&](Pool &pool, auto *lock) {
             while (pool.concurrent_state == ConcurrentState::SWEEPING) {
                 lock->unlock();
-                std::this_thread::yield();
+                detail::pause_thread();
                 lock->lock();
             }
             if (mode() != GcMode::STOP_THE_WORLD) {
