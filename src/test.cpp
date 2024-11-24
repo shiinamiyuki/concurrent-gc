@@ -1,7 +1,6 @@
 
 #include "gc.h"
 #include "rc.h"
-#include <random>
 #include <array>
 #include <numeric>
 #include <chrono>
@@ -124,88 +123,30 @@ void test_wb() {
         }
     }
 }
+// https://en.wikipedia.org/wiki/Permuted_congruential_generator
+struct Rng {
+    uint64_t state = 0x4d595df4d0f33173;// Or something seed-dependent
+    uint64_t const multiplier = 6364136223846793005u;
+    uint64_t const increment = 1442695040888963407u;// Or an arbitrary odd constant
 
-void test_random_graph() {
-    gc::GcOption option{};
-    option.max_heap_size = 1024 * 64;
-    gc::GcHeap::init(option);
-    std::random_device rd;
-    std::uniform_int_distribution<int> gen;
-    for (auto j = 0; j < 20; j++) {
-        std::vector<gc::Local<Node<int>>> nodes;
-        for (int i = 0; i < 100; i++) {
-            auto node = gc::Local<Node<int>>::make();
-            node->val = gen(rd);
-            nodes.push_back(node);
-        }
-        for (int i = 0; i < 100; i++) {
-            auto &node = nodes[i];
-            for (int j = 0; j < 10; j++) {
-                node->children->push_back(nodes[gen(rd) % nodes.size()]);
-            }
-        }
+    uint32_t rotr32(uint32_t x, unsigned r) {
+        return x >> r | x << (-r & 31);
     }
-}
 
-void test_random_graph2() {
-    printf("Running random graph test\n");
-    auto bench = [](gc::GcMode mode) {
-        printf("benchmarking %s\n", gc::to_string(mode));
-        gc::GcOption option{};
-        option.mode = mode;
-        option.max_heap_size = 1024 * 128;
-        option._full_debug = true;
-        gc::GcHeap::init(option);
-        std::random_device rd;
-        std::uniform_int_distribution<int> gen;
-        StatsTracker tracker;
-        for (auto j = 0; j < 50; j++) {
-            auto time = std::chrono::high_resolution_clock::now();
-            gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
-            for (int i = 0; i < 100; i++) {
-                auto node = gc::Local<Node<int>>::make();
-                node->val = i;
-                root->children->push_back(node);
-            }
-            auto random_walk = [&](gc::GcPtr<Node<int>> node) -> gc::GcPtr<Node<int>> {
-                while (true) {
-                    auto n_children = node->children->size();
-                    if (n_children == 0) {
-                        return node;
-                    }
-                    auto idx = gen(rd) % n_children;
-                    node = node->children->at(idx);
-                    auto terminate = gen(rd) % 10;
-                    if (terminate == 0) {
-                        return node;
-                    }
-                }
-            };
-            for (auto i = 0; i < 1000; i++) {
-                auto node1 = random_walk(root);
-                auto node2 = random_walk(root);
-                node1->children->push_back(node2);
-            }
-            auto all_nodes = find_all_nodes(gc::GcPtr<Node<int>>(root));
-            // printf("all_nodes.size() = %lld\n", all_nodes.size());
-            auto sum = std::accumulate(all_nodes.begin(), all_nodes.end(), 0, [](int acc, auto node) {
-                return acc + node->val;
-            });
-            // printf("sum = %d\n", sum);
-            GC_ASSERT(sum == 4950, "sum should be 4950");
-            auto elapsed = std::chrono::high_resolution_clock::now() - time;
-            // printf("elapsed = %lldus\n", std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
-            tracker.update(static_cast<double>(elapsed.count()) * 1e-6);
-        }
-        tracker.print("random_graph");
-        gc::get_heap().stats().print();
-        gc::GcHeap::destroy();
-        
-    };
-    bench(gc::GcMode::STOP_THE_WORLD);
-    bench(gc::GcMode::INCREMENTAL);
-    bench(gc::GcMode::CONCURRENT);
-}
+    uint32_t pcg32() {
+        uint64_t x = state;
+        unsigned count = (unsigned)(x >> 59);// 59 = 64 - 5
+
+        state = x * multiplier + increment;
+        x ^= x >> 18;                             // 18 = (64 - 27)/2
+        return rotr32((uint32_t)(x >> 27), count);// 27 = 32 - 5
+    }
+
+    Rng(uint64_t seed) {
+        state = seed + increment;
+        (void)pcg32();
+    }
+};
 
 void bench_allocation() {
     printf("Running allocation benchmark\n");
@@ -288,8 +229,7 @@ void bench_random_graph_large() {
         option.mode = mode;
         option.max_heap_size = 1024 * 1024 * 256;
         gc::GcHeap::init(option);
-        std::random_device rd;
-        std::uniform_int_distribution<int> gen;
+        Rng rng(0);
         StatsTracker tracker;
         {
             std::vector<gc::Local<Node<int>>> presistent_nodes;
@@ -308,9 +248,9 @@ void bench_random_graph_large() {
                         if (n_children == 0) {
                             return node;
                         }
-                        auto idx = gen(rd) % n_children;
+                        auto idx = rng.pcg32() % n_children;
                         node = node->children->at(idx);
-                        auto terminate = gen(rd) % 10;
+                        auto terminate = rng.pcg32() % 10;
                         if (terminate == 0) {
                             return node;
                         }
@@ -331,7 +271,7 @@ void bench_random_graph_large() {
                 if (presistent_nodes.size() <= 10) {
                     presistent_nodes.push_back(root);
                 } else {
-                    auto idx = gen(rd) % presistent_nodes.size();
+                    auto idx = rng.pcg32() % presistent_nodes.size();
                     // remove idx by swapping with the last element
                     std::swap(presistent_nodes[idx], presistent_nodes.back());
                     presistent_nodes.pop_back();
