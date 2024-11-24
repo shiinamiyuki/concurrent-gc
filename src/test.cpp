@@ -5,6 +5,7 @@
 #include <array>
 #include <numeric>
 #include <chrono>
+using StatsTracker = gc::StatsTracker;
 struct Bar : gc::Traceable {
     int val;
     explicit Bar(int val = 0) : val(val) {}
@@ -145,29 +146,11 @@ void test_random_graph() {
         }
     }
 }
-struct StatsTracker {
-    double mean = 0;
-    double max = 0;
-    double min = std::numeric_limits<double>::max();
-    double m2 = 0;
-    size_t count = 0;
-    void update(double x) {
-        max = std::max(max, x);
-        min = std::min(min, x);
-        count++;
-        double delta = x - mean;
-        mean += delta / count;
-        double delta2 = x - mean;
-        m2 += delta * delta2;
-    }
-    double variance() const {
-        return m2 / count;
-    }
-};
+
 void test_random_graph2() {
     printf("Running random graph test\n");
-    auto bench= [](gc::GcMode mode) {
-          printf("benchmarking %s\n", gc::to_string(mode));
+    auto bench = [](gc::GcMode mode) {
+        printf("benchmarking %s\n", gc::to_string(mode));
         gc::GcOption option{};
         option.mode = mode;
         option.max_heap_size = 1024 * 128;
@@ -214,11 +197,10 @@ void test_random_graph2() {
             // printf("elapsed = %lldus\n", std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
             tracker.update(static_cast<double>(elapsed.count()) * 1e-6);
         }
+        tracker.print("random_graph");
+        gc::get_heap().stats().print();
         gc::GcHeap::destroy();
-        printf("mean = %f\n", tracker.mean);
-        printf("max = %f\n", tracker.max);
-        printf("min = %f\n", tracker.min);
-        printf("variance = %f\n", tracker.variance());
+        
     };
     bench(gc::GcMode::STOP_THE_WORLD);
     bench(gc::GcMode::INCREMENTAL);
@@ -278,11 +260,10 @@ void bench_allocation_collect() {
                     node->val = i;
                     root->children->push_back(node);
                 }
-                 // simulate some work
+                // simulate some work
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 auto elapsed = std::chrono::high_resolution_clock::now() - time;
                 tracker.update(static_cast<double>(elapsed.count()) * 1e-3);
-               
             }
         };
         printf("benchmarking %s\n", gc::to_string(mode));
@@ -293,6 +274,75 @@ void bench_allocation_collect() {
         printf("max = %f\n", tracker.max);
         printf("min = %f\n", tracker.min);
         printf("variance = %f\n", tracker.variance());
+        gc::GcHeap::destroy();
+    };
+    bench(gc::GcMode::STOP_THE_WORLD);
+    bench(gc::GcMode::INCREMENTAL);
+    bench(gc::GcMode::CONCURRENT);
+}
+void bench_random_graph_large() {
+    printf("Running random graph benchmark (Large)\n");
+    auto bench = [](gc::GcMode mode) {
+        printf("benchmarking %s\n", gc::to_string(mode));
+        gc::GcOption option{};
+        option.mode = mode;
+        option.max_heap_size = 1024 * 1024 * 256;
+        gc::GcHeap::init(option);
+        std::random_device rd;
+        std::uniform_int_distribution<int> gen;
+        StatsTracker tracker;
+        {
+            std::vector<gc::Local<Node<int>>> presistent_nodes;
+            for (auto j = 0; j < 100; j++) {
+                auto time = std::chrono::high_resolution_clock::now();
+                gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
+                auto n = 32768;
+                for (int i = 0; i < n; i++) {
+                    auto node = gc::Local<Node<int>>::make();
+                    node->val = i;
+                    root->children->push_back(node);
+                }
+                auto random_walk = [&](gc::GcPtr<Node<int>> node) -> gc::GcPtr<Node<int>> {
+                    while (true) {
+                        auto n_children = node->children->size();
+                        if (n_children == 0) {
+                            return node;
+                        }
+                        auto idx = gen(rd) % n_children;
+                        node = node->children->at(idx);
+                        auto terminate = gen(rd) % 10;
+                        if (terminate == 0) {
+                            return node;
+                        }
+                    }
+                };
+                for (auto i = 0; i < 65536; i++) {
+                    auto node1 = random_walk(root);
+                    auto node2 = random_walk(root);
+                    node1->children->push_back(node2);
+                }
+                auto all_nodes = find_all_nodes(gc::GcPtr<Node<int>>(root));
+                // printf("all_nodes.size() = %lld\n", all_nodes.size());
+                auto sum = std::accumulate(all_nodes.begin(), all_nodes.end(), 0, [](int acc, auto node) {
+                    return acc + node->val;
+                });
+                // printf("sum = %d\n", sum);
+                GC_ASSERT(sum == (n - 1) * n / 2, "invalid sum");
+                if (presistent_nodes.size() <= 10) {
+                    presistent_nodes.push_back(root);
+                } else {
+                    auto idx = gen(rd) % presistent_nodes.size();
+                    // remove idx by swapping with the last element
+                    std::swap(presistent_nodes[idx], presistent_nodes.back());
+                    presistent_nodes.pop_back();
+                }
+                auto elapsed = std::chrono::high_resolution_clock::now() - time;
+                // printf("elapsed = %lldus\n", std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+                tracker.update(static_cast<double>(elapsed.count()) * 1e-6);
+            }
+        }
+        tracker.print("bench random_graph");
+        gc::get_heap().stats().print();
         gc::GcHeap::destroy();
     };
     bench(gc::GcMode::STOP_THE_WORLD);
@@ -328,6 +378,6 @@ void bench_allocation_collect() {
 int main() {
     bench_allocation();
     bench_allocation_collect();
-    test_random_graph2();
+    bench_random_graph_large();
     return 0;
 }

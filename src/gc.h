@@ -317,7 +317,7 @@ struct WorkList {
 struct GcOption {
     GcMode mode = GcMode::INCREMENTAL;
     size_t max_heap_size = 1024 * 1024 * 1024;
-    double gc_threshold = 0.5;// when should a gc be triggered
+    double gc_threshold = 0.9;// when should a gc be triggered
     bool _full_debug = false;
 };
 // namespace detail {
@@ -335,6 +335,69 @@ struct GcOption {
 //     }
 // };
 // }// namespace detail
+struct StatsTracker {
+    double mean = 0;
+    double max = 0;
+    double min = std::numeric_limits<double>::max();
+    double m2 = 0;
+    size_t count = 0;
+    void update(double x) {
+        max = std::max(max, x);
+        min = std::min(min, x);
+        count++;
+        double delta = x - mean;
+        mean += delta / count;
+        double delta2 = x - mean;
+        m2 += delta * delta2;
+    }
+    double variance() const {
+        return m2 / count;
+    }
+    void print(const char *name) const {
+        if (count > 1) {
+            std::printf("%s: mean = %f, max = %f, min = %f, variance = %f\n", name, mean, max, min, variance());
+        } else {
+            std::printf("%s: mean = %f\n", name, mean);
+        }
+    }
+};
+struct GcStats {
+    std::atomic<size_t> n_allocated = 0;
+    std::atomic<size_t> n_collection_cycles = 0;
+    StatsTracker collection_time;
+    StatsTracker ratio_collected;
+    double incremental_time = 0;
+    void print() const {
+        std::printf("GC stats\n");
+        std::printf("n_allocated = %lld\n", n_allocated.load());
+        std::printf("n_collection_cycles = %lld\n", n_collection_cycles.load());
+        collection_time.print("collection_time");
+        ratio_collected.print("ratio_collected");
+    }
+    void reset() {
+        n_allocated = 0;
+        n_collection_cycles = 0;
+        collection_time = {};
+        ratio_collected = {};
+    }
+};
+template<class F, typename R = std::invoke_result_t<F>>
+auto time_function(F &&f) {
+    if constexpr (std::is_same_v<R, void>) {
+        auto start = std::chrono::high_resolution_clock::now();
+        f();
+        auto end = std::chrono::high_resolution_clock::now();
+        double elapsed = static_cast<double>((end - start).count() * 1e-9);
+        return elapsed;
+    } else {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto result = f();
+        auto end = std::chrono::high_resolution_clock::now();
+        double elapsed = static_cast<double>((end - start).count() * 1e-9);
+        return std::make_pair(result, elapsed);
+    }
+}
+
 class GcHeap {
     friend struct TracingContext;
     template<class T>
@@ -366,6 +429,7 @@ class GcHeap {
             alloc_.emplace(inner.get());
         }
     };
+    GcStats stats_;
     struct ObjectList {
         GcObjectContainer *head = nullptr;
     };
@@ -516,6 +580,9 @@ class GcHeap {
     }
     void concurrent_collector();
 public:
+    GcStats &stats() {
+        return stats_;
+    }
     std::pmr::memory_resource *memory_resource() {
         return &gc_memory_resource_;
     }

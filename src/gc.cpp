@@ -111,27 +111,31 @@ void GcHeap::concurrent_collector() {
             return;
         }
 
-        scan_roots();
-        // marking only acquire lock on the work list
-        // but not the pool. at this time, the mutator can still allocate and push stuff to the pool
-        // what do we do?
-        while (mark_some(10)) {}
-        pool_.with([&](Pool &pool, auto *lock) {
-            GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
-            pool.concurrent_state = ConcurrentState::SWEEPING;
-        });
-        if constexpr (is_debug) {
-            std::printf("Concurrent sweeping\n");
-        }
-
-        pool_.with([&](Pool &pool, auto *lock) {
+        auto t = time_function([&]() {
+            scan_roots();
+            // marking only acquire lock on the work list
+            // but not the pool. at this time, the mutator can still allocate and push stuff to the pool
+            // what do we do?
             while (mark_some(10)) {}
-            sweep();
-            pool.concurrent_state = ConcurrentState::IDLE;
+            pool_.with([&](Pool &pool, auto *lock) {
+                GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
+                pool.concurrent_state = ConcurrentState::SWEEPING;
+            });
             if constexpr (is_debug) {
-                std::printf("Concurrent collection done\n");
+                std::printf("Concurrent sweeping\n");
             }
+
+            pool_.with([&](Pool &pool, auto *lock) {
+                while (mark_some(10)) {}
+                sweep();
+                pool.concurrent_state = ConcurrentState::IDLE;
+                if constexpr (is_debug) {
+                    std::printf("Concurrent collection done\n");
+                }
+            });
         });
+        stats_.collection_time.update(t);
+        stats_.n_collection_cycles.fetch_add(1, std::memory_order_relaxed);
     }
 }
 void GcHeap::init(GcOption option) {
@@ -217,6 +221,8 @@ void GcHeap::sweep() {
             std::printf("sweeping %d objects, %d roots\n", obj_cnt, root_cnt);
         }
         GcObjectContainer *prev = nullptr;
+        auto cnt = 0ull;
+        auto collect_cnt = 0ull;
         auto ptr = list.head;
         while (ptr) {
             auto next = ptr->next_;
@@ -240,34 +246,42 @@ void GcHeap::sweep() {
                     prev->next_ = next;
                 }
                 ptr = next;
+                collect_cnt++;
             }
+            cnt++;
         }
+        stats_.ratio_collected.update(static_cast<double>(collect_cnt) / cnt);
     });
+
     if (mode_ != GcMode::CONCURRENT) {
         state() = State::IDLE;
     }
 }
 void GcHeap::collect() {
-    if constexpr (is_debug) {
-        std::printf("starting full collection\n");
-    }
-    auto object_list = object_list_.get();
-    auto ptr = object_list.head;
-    while (ptr) {
-        ptr->set_color(color::WHITE);
-        ptr = ptr->next_;
-    }
-    work_list.get().clear();
-    if (mode_ != GcMode::CONCURRENT) {
-        state() = State::MARKING;
-    }
-    scan_roots();
-    while (!work_list.get().empty()) {
-        mark_some(10);
-    }
-    sweep();
-    if constexpr (is_debug) {
-        std::printf("full collection done\n");
-    }
+    auto t = time_function([&]() {
+        if constexpr (is_debug) {
+            std::printf("starting full collection\n");
+        }
+        auto object_list = object_list_.get();
+        auto ptr = object_list.head;
+        while (ptr) {
+            ptr->set_color(color::WHITE);
+            ptr = ptr->next_;
+        }
+        work_list.get().clear();
+        if (mode_ != GcMode::CONCURRENT) {
+            state() = State::MARKING;
+        }
+        scan_roots();
+        while (!work_list.get().empty()) {
+            mark_some(10);
+        }
+        sweep();
+        if constexpr (is_debug) {
+            std::printf("full collection done\n");
+        }
+    });
+    stats_.collection_time.update(t);
+    stats_.n_collection_cycles.fetch_add(1, std::memory_order_relaxed);
 }
 }// namespace gc
