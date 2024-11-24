@@ -345,8 +345,8 @@ void bench_random_graph_large() {
         gc::get_heap().stats().print();
         gc::GcHeap::destroy();
     };
-    bench(gc::GcMode::STOP_THE_WORLD);
-    bench(gc::GcMode::INCREMENTAL);
+    // bench(gc::GcMode::STOP_THE_WORLD);
+    // bench(gc::GcMode::INCREMENTAL);
     bench(gc::GcMode::CONCURRENT);
 }
 // void test_random() {
@@ -376,8 +376,8 @@ void bench_random_graph_large() {
 //     // }
 // }
 int main() {
-    bench_allocation();
-    bench_allocation_collect();
+    // bench_allocation();
+    // bench_allocation_collect();
     bench_random_graph_large();
     return 0;
 }
