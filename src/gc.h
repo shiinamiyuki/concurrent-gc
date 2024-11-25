@@ -347,7 +347,7 @@ struct WorkList {
 struct GcOption {
     GcMode mode = GcMode::INCREMENTAL;
     size_t max_heap_size = 1024 * 1024 * 1024;
-    double gc_threshold = 0.9;// when should a gc be triggered
+    double gc_threshold = 0.5;// when should a gc be triggered
     bool _full_debug = false;
 };
 // namespace detail {
@@ -393,12 +393,15 @@ struct StatsTracker {
 };
 struct GcStats {
     std::atomic<size_t> n_allocated = 0;
+    std::atomic<size_t> n_collected = 0;
     std::atomic<size_t> n_collection_cycles = 0;
+    size_t last_collected = 0;
+    std::chrono::high_resolution_clock::time_point last_collect_time = std::chrono::high_resolution_clock::now();
     StatsTracker collection_time;
     StatsTracker ratio_collected;
     StatsTracker sweep_time;
     double incremental_time = 0;
-    double idle_time = 0;
+    double wait_for_atomic_marking = 0;
     double time_waiting_for_pool = 0;
     double time_waiting_for_object_list = 0;
     double time_waiting_for_work_list = 0;
@@ -407,7 +410,7 @@ struct GcStats {
         std::printf("GC stats\n");
         std::printf("n_allocated = %lld\n", n_allocated.load());
         std::printf("n_collection_cycles = %lld\n", n_collection_cycles.load());
-        std::printf("mutator idle time = %f\n", idle_time);
+        std::printf("mutator waiting for atomic marking = %f\n", wait_for_atomic_marking);
         std::printf("mutator waiting for pool = %f\n", time_waiting_for_pool);
         std::printf("mutator waiting for object list = %f\n", time_waiting_for_object_list);
         std::printf("mutator waiting for work list = %f\n", time_waiting_for_work_list);
@@ -420,7 +423,7 @@ struct GcStats {
         n_allocated = 0;
         n_collection_cycles = 0;
         incremental_time = 0;
-        idle_time = 0;
+        wait_for_atomic_marking = 0;
         time_waiting_for_pool = 0;
         time_waiting_for_object_list = 0;
         time_waiting_for_work_list = 0;
@@ -471,6 +474,7 @@ class GcHeap {
         IDLE,
         REQUESTED,
         MARKING,
+        ATOMIC_MARKING,
         SWEEPING
     };
     struct Pool {
@@ -510,7 +514,7 @@ class GcHeap {
     }
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr) {
-
+        stats_.n_collected.fetch_add(1, std::memory_order_relaxed);
         stats_.time_waiting_for_pool += pool_.with_timed([&](auto &pool, auto *lock) {
             if constexpr (is_debug) {
                 std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), pool.allocation_size_, max_heap_size_);
@@ -684,8 +688,8 @@ public:
         auto [ptr, t] = pool_.with_timed([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
                 // GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
-                stats_.idle_time += time_function([&] {
-                    while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                stats_.wait_for_atomic_marking += time_function([&] {
+                    while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
                         if constexpr (is_debug) {
                             std::printf("Waiting for sweeping\n");
                         }
@@ -705,6 +709,7 @@ public:
             pool.allocation_size_ += sizeof(T);
             return ptr;
         });
+        stats_.n_allocated.fetch_add(1, std::memory_order_relaxed);
         stats_.time_waiting_for_pool += t;
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
         GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
@@ -712,8 +717,8 @@ public:
 
         stats_.time_waiting_for_pool += pool_.with_timed([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
-                stats_.idle_time += time_function([&]() {
-                    while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                stats_.wait_for_atomic_marking += time_function([&]() {
+                    while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
                         lock->unlock();
                         detail::pause_thread();
                         lock->lock();
@@ -1002,7 +1007,7 @@ class Member {
                 if constexpr (is_debug) {
                     std::printf("write barrier, color=%d\n", ptr->color());
                 }
-                heap.stats_.idle_time += heap.work_list.with_timed([&](auto &work_list, auto *lock) { heap.shade(ptr.gc_object_container()); });
+                heap.stats_.wait_for_atomic_marking += heap.work_list.with_timed([&](auto &work_list, auto *lock) { heap.shade(ptr.gc_object_container()); });
             }
         }
     }

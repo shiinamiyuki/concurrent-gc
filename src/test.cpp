@@ -234,7 +234,7 @@ void bench_random_graph_large() {
         StatsTracker tracker;
         {
             std::vector<gc::Local<Node<int>>> presistent_nodes;
-            for (auto j = 0; j < 100; j++) {
+            for (auto j = 0; j < 40; j++) {
                 auto time = std::chrono::high_resolution_clock::now();
                 gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
                 auto n = 32768;
@@ -287,8 +287,8 @@ void bench_random_graph_large() {
         gc::get_heap().stats().print();
         gc::GcHeap::destroy();
     };
-    // bench(gc::GcMode::STOP_THE_WORLD);
-    // bench(gc::GcMode::INCREMENTAL);
+    bench(gc::GcMode::STOP_THE_WORLD);
+    bench(gc::GcMode::INCREMENTAL);
     bench(gc::GcMode::CONCURRENT);
 }
 // void test_random() {
@@ -318,8 +318,8 @@ void bench_random_graph_large() {
 //     // }
 // }
 int main() {
-    // bench_allocation();
-    // bench_allocation_collect();
+    bench_allocation();
+    bench_allocation_collect();
     bench_random_graph_large();
     return 0;
 }
