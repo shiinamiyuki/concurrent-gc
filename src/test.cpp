@@ -4,6 +4,7 @@
 #include <array>
 #include <numeric>
 #include <chrono>
+#include "test_common.h"
 using StatsTracker = gc::StatsTracker;
 struct Bar : gc::Traceable {
     int val;
