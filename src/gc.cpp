@@ -1,6 +1,7 @@
 #include "gc.h"
 #include <optional>
 namespace gc {
+bool enable_time_tracking = false;
 void TracingContext::shade(const GcObjectContainer *ptr) const noexcept {
     // heap.work_list.with([&](auto &wl, auto *lock) {
     heap.shade(ptr);
@@ -44,14 +45,14 @@ void GcHeap::do_concurrent(size_t inc_size) {
         auto threshold = [&]() -> bool {
             return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
         };
-        while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+        stats_.idle_time += time_function([&] { while (pool.concurrent_state == ConcurrentState::SWEEPING) {
             if constexpr (is_debug) {
                 std::printf("Waiting for sweeping\n");
             }
             lock->unlock();
             detail::pause_thread();
             lock->lock();
-        }
+        } });
         // in concurrent mode, the mutator might allocate too fast such that a single sweep is not enough
         // this is partly due to newly allocated objects are only collected in the next sweep
         auto n_retry = 2;
@@ -64,6 +65,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
                 if (!is_mem_available()) {
                     GC_ASSERT(pool.concurrent_state != ConcurrentState::IDLE, "State should not be idle");
                     if (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
+                        stats_.idle_time += time_function([&] {
                         while (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
                             if constexpr (is_debug) {
                                 std::printf("Memory not enough, waiting for collection\n");
@@ -71,16 +73,18 @@ void GcHeap::do_concurrent(size_t inc_size) {
                             lock->unlock();
                             detail::pause_thread();
                             lock->lock();
-                        }
+                        } });
                     }
-                    while (pool.concurrent_state == ConcurrentState::SWEEPING) {
-                        if constexpr (is_debug) {
-                            std::printf("Waiting for sweeping\n");
+                    stats_.idle_time += time_function([&] {
+                        while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                            if constexpr (is_debug) {
+                                std::printf("Waiting for sweeping\n");
+                            }
+                            lock->unlock();
+                            detail::pause_thread();
+                            lock->lock();
                         }
-                        lock->unlock();
-                        detail::pause_thread();
-                        lock->lock();
-                    }
+                    });
                 }
                 if (is_mem_available()) {
                     return;
@@ -116,18 +120,19 @@ void GcHeap::concurrent_collector() {
             // marking only acquire lock on the work list
             // but not the pool. at this time, the mutator can still allocate and push stuff to the pool
             // what do we do?
-            while (mark_some(10)) {}
+            while (mark_some(64)) {}
             pool_.with([&](Pool &pool, auto *lock) {
                 GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
                 pool.concurrent_state = ConcurrentState::SWEEPING;
-            });
-            if constexpr (is_debug) {
-                std::printf("Concurrent sweeping\n");
-            }
 
+                if constexpr (is_debug) {
+                    std::printf("Concurrent sweeping\n");
+                }
+
+                while (mark_some(0xffff)) {}
+            });
+            sweep();
             pool_.with([&](Pool &pool, auto *lock) {
-                while (mark_some(10)) {}
-                sweep();
                 pool.concurrent_state = ConcurrentState::IDLE;
                 if constexpr (is_debug) {
                     std::printf("Concurrent collection done\n");
@@ -205,59 +210,63 @@ void GcHeap::sweep() {
     if (mode_ != GcMode::CONCURRENT) {
         state() = State::SWEEPING;
     }
-    object_list_.with([&](auto &list, auto *lock) {
-        if constexpr (is_debug) {
-            std::printf("starting sweep\n");
-            auto obj_cnt = 0;
-            auto root_cnt = 0;
+    auto t = time_function([&] {
+        object_list_.with([&](auto &list, auto *lock) {
+            if constexpr (is_debug) {
+                std::printf("starting sweep\n");
+                auto obj_cnt = 0;
+                auto root_cnt = 0;
+                auto ptr = list.head;
+                while (ptr) {
+                    obj_cnt++;
+                    if (ptr->is_root()) {
+                        root_cnt++;
+                    }
+                    ptr = ptr->next_;
+                }
+                std::printf("sweeping %d objects, %d roots\n", obj_cnt, root_cnt);
+            }
+            GcObjectContainer *prev = nullptr;
+            auto cnt = 0ull;
+            auto collect_cnt = 0ull;
             auto ptr = list.head;
             while (ptr) {
-                obj_cnt++;
+                auto next = ptr->next_;
+                // if (mode() != GcMode::CONCURRENT) {
+                //     GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
+                // }
+                GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
                 if (ptr->is_root()) {
-                    root_cnt++;
+                    GC_ASSERT(ptr->color() == color::BLACK, "Root should be black");
                 }
-                ptr = ptr->next_;
-            }
-            std::printf("sweeping %d objects, %d roots\n", obj_cnt, root_cnt);
-        }
-        GcObjectContainer *prev = nullptr;
-        auto cnt = 0ull;
-        auto collect_cnt = 0ull;
-        auto ptr = list.head;
-        while (ptr) {
-            auto next = ptr->next_;
-            // if (mode() != GcMode::CONCURRENT) {
-            //     GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
-            // }
-            GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
-            if (ptr->is_root()) {
-                GC_ASSERT(ptr->color() == color::BLACK, "Root should be black");
-            }
-            if (ptr->color() == color::BLACK) {
-                prev = ptr;
-                ptr->set_color(color::WHITE);
-                ptr = next;
-            } else {
-                free_object(ptr);
-                // GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
-                if (!prev) {
-                    list.head = next;
+                if (ptr->color() == color::BLACK) {
+                    prev = ptr;
+                    ptr->set_color(color::WHITE);
+                    ptr = next;
                 } else {
-                    prev->next_ = next;
+                    free_object(ptr);
+                    // GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
+                    if (!prev) {
+                        list.head = next;
+                    } else {
+                        prev->next_ = next;
+                    }
+                    ptr = next;
+                    collect_cnt++;
                 }
-                ptr = next;
-                collect_cnt++;
+                cnt++;
             }
-            cnt++;
-        }
-        stats_.ratio_collected.update(static_cast<double>(collect_cnt) / cnt);
-    });
+            stats_.ratio_collected.update(static_cast<double>(collect_cnt) / cnt);
+        });
 
-    if (mode_ != GcMode::CONCURRENT) {
-        state() = State::IDLE;
-    }
+        if (mode_ != GcMode::CONCURRENT) {
+            state() = State::IDLE;
+        }
+    });
+    stats_.sweep_time.update(t);
 }
 void GcHeap::collect() {
+
     auto t = time_function([&]() {
         if constexpr (is_debug) {
             std::printf("starting full collection\n");
@@ -281,7 +290,11 @@ void GcHeap::collect() {
             std::printf("full collection done\n");
         }
     });
+    if (stats_.incremental_time > 0.0) {
+        t += stats_.incremental_time;
+    }
     stats_.collection_time.update(t);
     stats_.n_collection_cycles.fetch_add(1, std::memory_order_relaxed);
+    stats_.incremental_time = 0;
 }
 }// namespace gc

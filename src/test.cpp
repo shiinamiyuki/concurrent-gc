@@ -223,6 +223,7 @@ void bench_allocation_collect() {
 }
 void bench_random_graph_large() {
     printf("Running random graph benchmark (Large)\n");
+    gc::enable_time_tracking = true;
     auto bench = [](gc::GcMode mode) {
         printf("benchmarking %s\n", gc::to_string(mode));
         gc::GcOption option{};
@@ -281,6 +282,7 @@ void bench_random_graph_large() {
                 tracker.update(static_cast<double>(elapsed.count()) * 1e-6);
             }
         }
+        printf("total time = %f\n", tracker.mean * tracker.count);
         tracker.print("bench random_graph");
         gc::get_heap().stats().print();
         gc::GcHeap::destroy();

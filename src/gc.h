@@ -31,6 +31,8 @@ constexpr bool is_debug = true;
 constexpr bool is_debug = false;
 #endif
 constexpr bool verbose_output = true;
+extern bool enable_time_tracking;
+
 namespace detail {
 // template<class T>
 // T *encode_pointer(T *ptr, uint16_t tag) {
@@ -45,7 +47,7 @@ namespace detail {
 //     return static_cast<uint16_t>(reinterpret_cast<uintptr_t>(ptr) >> 48);
 // }
 inline void pause_thread() {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(_WIN64)
     _mm_pause();
 #else
     std::this_thread::yield();
@@ -159,6 +161,34 @@ public:
                 lock->unlock();
             }
             return result;
+        }
+    }
+    template<class F>
+        requires std::invocable<F, T &, Lock *>
+    auto with_timed(F &&f) -> decltype(auto) {
+        auto lock_time = 0.0;
+        using R = std::invoke_result_t<F, T &, Lock *>;
+        if (lock.has_value()) {
+            if (enable_time_tracking) {
+                auto t = std::chrono::steady_clock::now();
+                lock->lock();
+                lock_time = (std::chrono::steady_clock::now() - t).count() * 1e-9;
+            } else {
+                lock->lock();
+            }
+        }
+        if constexpr (std::is_void_v<R>) {
+            f(data, lock.has_value() ? &lock.value() : nullptr);
+            if (lock.has_value()) {
+                lock->unlock();
+            }
+            return lock_time;
+        } else {
+            auto result = f(data, lock.has_value() ? &lock.value() : nullptr);
+            if (lock.has_value()) {
+                lock->unlock();
+            }
+            return std::make_pair(result, lock_time);
         }
     }
     T &get() {
@@ -366,35 +396,63 @@ struct GcStats {
     std::atomic<size_t> n_collection_cycles = 0;
     StatsTracker collection_time;
     StatsTracker ratio_collected;
+    StatsTracker sweep_time;
     double incremental_time = 0;
+    double idle_time = 0;
+    double time_waiting_for_pool = 0;
+    double time_waiting_for_object_list = 0;
+    double time_waiting_for_work_list = 0;
+    double time_waiting_for_root_set = 0;
     void print() const {
         std::printf("GC stats\n");
         std::printf("n_allocated = %lld\n", n_allocated.load());
         std::printf("n_collection_cycles = %lld\n", n_collection_cycles.load());
+        std::printf("mutator idle time = %f\n", idle_time);
+        std::printf("mutator waiting for pool = %f\n", time_waiting_for_pool);
+        std::printf("mutator waiting for object list = %f\n", time_waiting_for_object_list);
+        std::printf("mutator waiting for work list = %f\n", time_waiting_for_work_list);
+        std::printf("mutator waiting for root set = %f\n", time_waiting_for_root_set);
+        sweep_time.print("sweep_time");
         collection_time.print("collection_time");
         ratio_collected.print("ratio_collected");
     }
     void reset() {
         n_allocated = 0;
         n_collection_cycles = 0;
+        incremental_time = 0;
+        idle_time = 0;
+        time_waiting_for_pool = 0;
+        time_waiting_for_object_list = 0;
+        time_waiting_for_work_list = 0;
+        time_waiting_for_root_set = 0;
         collection_time = {};
         ratio_collected = {};
+        sweep_time = {};
     }
 };
 template<class F, typename R = std::invoke_result_t<F>>
 auto time_function(F &&f) {
-    if constexpr (std::is_same_v<R, void>) {
-        auto start = std::chrono::high_resolution_clock::now();
-        f();
-        auto end = std::chrono::high_resolution_clock::now();
-        double elapsed = static_cast<double>((end - start).count() * 1e-9);
-        return elapsed;
+    if (enable_time_tracking) {
+        if constexpr (std::is_same_v<R, void>) {
+            auto start = std::chrono::high_resolution_clock::now();
+            f();
+            auto end = std::chrono::high_resolution_clock::now();
+            double elapsed = static_cast<double>((end - start).count() * 1e-9);
+            return elapsed;
+        } else {
+            auto start = std::chrono::high_resolution_clock::now();
+            auto result = f();
+            auto end = std::chrono::high_resolution_clock::now();
+            double elapsed = static_cast<double>((end - start).count() * 1e-9);
+            return std::make_pair(result, elapsed);
+        }
     } else {
-        auto start = std::chrono::high_resolution_clock::now();
-        auto result = f();
-        auto end = std::chrono::high_resolution_clock::now();
-        double elapsed = static_cast<double>((end - start).count() * 1e-9);
-        return std::make_pair(result, elapsed);
+        if constexpr (std::is_same_v<R, void>) {
+            f();
+            return 0.0;
+        } else {
+            return std::make_pair(f(), 0.0);
+        }
     }
 }
 
@@ -453,7 +511,7 @@ class GcHeap {
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr) {
 
-        pool_.with([&](auto &pool, auto *lock) {
+        stats_.time_waiting_for_pool += pool_.with_timed([&](auto &pool, auto *lock) {
             if constexpr (is_debug) {
                 std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), pool.allocation_size_, max_heap_size_);
             }
@@ -499,14 +557,27 @@ class GcHeap {
             if constexpr (is_debug) {
                 std::printf("%lld items in work list\n", work_list.get().list.size());
             }
-
-            if (!mark_some(10)) {
-                sweep();
+            auto [mark_end, t_mark] = time_function([this] { return !mark_some(10); });
+            stats_.incremental_time += t_mark;
+            if (mark_end) {
+                auto t = time_function([this] {
+                    sweep();
+                });
+                stats_.incremental_time += t;
+                stats_.n_collection_cycles++;
+                stats_.collection_time.update(stats_.incremental_time);
+                stats_.incremental_time = 0;
                 return;
             }
             if (pool_.get().allocation_size_ + inc_size > max_heap_size_) {
-                while (mark_some(10)) {}
-                sweep();
+                auto t = time_function([this] {
+                    while (mark_some(10)) {}
+                    sweep();
+                });
+                stats_.incremental_time += t;
+                stats_.n_collection_cycles++;
+                stats_.collection_time.update(stats_.incremental_time);
+                stats_.incremental_time = 0;
             }
             return;
         }
@@ -525,7 +596,7 @@ class GcHeap {
             if constexpr (is_debug) {
                 std::printf("threshold condition\n");
             }
-            scan_roots();
+            stats_.incremental_time += time_function([this] { scan_roots(); });
         }
     }
     struct gc_memory_resource : std::pmr::memory_resource {
@@ -533,7 +604,7 @@ class GcHeap {
         gc_memory_resource(GcHeap *heap) : heap(heap) {}
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
             heap->prepare_allocation(bytes);
-            return heap->pool_.with([&](auto &pool, auto *lock) -> void * {
+            auto [ptr, t] = heap->pool_.with_timed([&](auto &pool, auto *lock) -> void * {
                 pool.allocation_size_ += bytes;
                 auto ptr = pool.inner->allocate(bytes, alignment);
                 if constexpr (is_debug) {
@@ -541,11 +612,13 @@ class GcHeap {
                 }
                 return ptr;
             });
+            heap->stats_.time_waiting_for_pool += t;
+            return ptr;
         }
         void do_deallocate(void *p,
                            std::size_t bytes,
                            std::size_t alignment) override {
-            return heap->pool_.with([&](auto &pool, auto *lock) {
+            heap->stats_.time_waiting_for_pool += heap->pool_.with_timed([&](auto &pool, auto *lock) {
                 pool.allocation_size_ -= bytes;
                 if constexpr (is_debug) {
                     std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, pool.allocation_size_, heap->max_heap_size_);
@@ -608,17 +681,19 @@ public:
         }
         prepare_allocation(sizeof(T));
 
-        auto ptr = pool_.with([&](Pool &pool, auto *lock) {
+        auto [ptr, t] = pool_.with_timed([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
                 // GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
-                while (pool.concurrent_state == ConcurrentState::SWEEPING) {
-                    if constexpr (is_debug) {
-                        std::printf("Waiting for sweeping\n");
+                stats_.idle_time += time_function([&] {
+                    while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                        if constexpr (is_debug) {
+                            std::printf("Waiting for sweeping\n");
+                        }
+                        lock->unlock();
+                        detail::pause_thread();
+                        lock->lock();
                     }
-                    lock->unlock();
-                    detail::pause_thread();
-                    lock->lock();
-                }
+                });
             }
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
             auto ptr = pool.alloc_->allocate_object<T>(1);
@@ -630,27 +705,32 @@ public:
             pool.allocation_size_ += sizeof(T);
             return ptr;
         });
+        stats_.time_waiting_for_pool += t;
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
         GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
         ptr->set_alive(true);
 
-        pool_.with([&](Pool &pool, auto *lock) {
-            while (pool.concurrent_state == ConcurrentState::SWEEPING) {
-                lock->unlock();
-                detail::pause_thread();
-                lock->lock();
+        stats_.time_waiting_for_pool += pool_.with_timed([&](Pool &pool, auto *lock) {
+            if (mode() == GcMode::CONCURRENT) {
+                stats_.idle_time += time_function([&]() {
+                    while (pool.concurrent_state == ConcurrentState::SWEEPING) {
+                        lock->unlock();
+                        detail::pause_thread();
+                        lock->lock();
+                    }
+                });
             }
             if (mode() != GcMode::STOP_THE_WORLD) {
                 // this is necessary, you can't just color it black since the above line `T(std::forward<Args>(args)...);`
                 // invokes the constructor and might setup some member pointers
-                work_list.with([&](auto &work_list, auto *lock) {
+                stats_.time_waiting_for_work_list += work_list.with_timed([&](auto &work_list, auto *lock) {
                     shade(ptr);
                 });
             }
             // possible sync issue here
             // while allocation only happens when collector is not in sweeping
             // at this line, the collector might just start sweeping
-            object_list_.with([&](auto &list, auto *lock) {
+            stats_.time_waiting_for_object_list += object_list_.with_timed([&](auto &list, auto *lock) {
                 if (list.head == nullptr) {
                     list.head = ptr;
                 } else {
@@ -802,16 +882,18 @@ class Local {
             if (ptr_.gc_object_container()->root_ref_count == 1) {
                 // become a new root, add to the root set
                 auto &heap = get_heap();
-                get_heap().root_set().with([&](auto &rs, auto *lock) {
+                heap.stats_.time_waiting_for_root_set += heap.root_set().with_timed([&](auto &rs, auto *lock) {
                     auto node = rs.add(ptr_.gc_object_container());
                     if constexpr (is_debug) {
                         std::printf("adding root %p\n", static_cast<const void *>(ptr_.gc_object_container()));
                     }
                     ptr_.root_node().emplace(node);
                 });
-                get_heap().work_list.with([&](auto &work_list, auto *lock) {
-                    heap.shade(ptr_.gc_object_container());
-                });
+                if (ptr_.gc_object_container()->color() == color::WHITE) {
+                    heap.stats_.time_waiting_for_work_list += heap.work_list.with_timed([&](auto &work_list, auto *lock) {
+                        heap.shade(ptr_.gc_object_container());
+                    });
+                }
             }
         }
     }
@@ -825,7 +907,7 @@ class Local {
                 }
 
                 auto &heap = get_heap();
-                get_heap().root_set().with([&](auto &rs, auto *lock) {
+                heap.stats_.time_waiting_for_root_set += heap.root_set().with_timed([&](auto &rs, auto *lock) {
                     rs.remove(*ptr_.root_node());
                     ptr_.root_node().reset();
                 });
@@ -914,16 +996,15 @@ class Member {
         }
 
         auto &heap = get_heap();
-        heap.work_list.with([&](auto &work_list, auto *lock) {
-            if (heap.need_write_barrier()) [[likely]] {
-                if (parent_->color() == color::BLACK) {
-                    if constexpr (is_debug) {
-                        std::printf("write barrier, color=%d\n", ptr->color());
-                    }
-                    heap.shade(ptr.gc_object_container());
+
+        if (heap.need_write_barrier()) [[likely]] {
+            if (parent_->color() == color::BLACK) {
+                if constexpr (is_debug) {
+                    std::printf("write barrier, color=%d\n", ptr->color());
                 }
+                heap.stats_.idle_time += heap.work_list.with_timed([&](auto &work_list, auto *lock) { heap.shade(ptr.gc_object_container()); });
             }
-        });
+        }
     }
 public:
     template<is_traceable U>
