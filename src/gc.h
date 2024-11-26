@@ -882,10 +882,13 @@ struct apply_trace<GcPtr<T>> {
         ctx.shade(ptr.gc_object_container());
     }
 };
-
+template<class U>
+class Member;
 /// @brief an on stack handle to a gc object
 template<class T>
 class Local {
+    template<class U>
+    friend class Member;
     GcPtr<T> ptr_;
     void inc() {
         if (ptr_.gc_object_container()) {
