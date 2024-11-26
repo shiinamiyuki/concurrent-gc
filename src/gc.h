@@ -66,7 +66,7 @@ struct spin_lock {
             }
             auto i = 1;
             while (lock_.load(std::memory_order_relaxed)) {
-                for(auto j = 0; j < i; j++) {
+                for (auto j = 0; j < i; j++) {
                     detail::pause_thread();
                 }
                 i *= 2;
@@ -300,7 +300,7 @@ public:
         return this;
     }
     ~Traceable() {}
-}; 
+};
 template<class T>
 class GarbageCollected : public Traceable {};
 
@@ -933,9 +933,13 @@ public:
     Local(Local &&other) noexcept : ptr_(other.ptr_) {
         other.ptr_.reset();
     }
-    explicit Local(GcPtr<T> ptr) : ptr_(ptr) {
+    Local(GcPtr<T> ptr) : ptr_(ptr) {
         inc();
     }
+    Local(const Member<T> &member) : ptr_(member.ptr_) {
+        inc();
+    }
+
     template<class... Args>
         requires std::constructible_from<T, Args...>
     static Local make(Args &&...args) {
@@ -976,6 +980,12 @@ public:
         inc();
         return *this;
     }
+    Local &operator=(const Member<T> &member) {
+        dec();
+        ptr_ = member.ptr_;
+        inc();
+        return *this;
+    }
     Local &operator=(const GcPtr<T> &ptr) {
         dec();
         ptr_ = ptr;
@@ -995,6 +1005,8 @@ class Member {
     friend struct apply_trace;
     template<class U>
     friend class GcArray;
+    template<class U>
+    friend class Local;
     GcPtr<T> ptr_;
     GcObjectContainer *parent_;
     Member(GcObjectContainer *parent, GcPtr<T> ptr) : ptr_(ptr), parent_(parent) {}

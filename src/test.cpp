@@ -151,8 +151,8 @@ struct Rng {
     }
 };
 
-void bench_allocation() {
-    printf("Running allocation benchmark\n");
+void bench_short_lived_few_update() {
+    printf("Running bench_short_lived_few_update\n");
     auto bench = []<class C>(C policy) {
         // gc::GcOption option{};
         // option.mode = mode;
@@ -200,7 +200,77 @@ void bench_allocation() {
     bench(RcPolicy<rc::RefCounter>{});
     bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 64;
+    option.max_heap_size = 1024 * 16;
+    option.mode = gc::GcMode::STOP_THE_WORLD;
+    bench(GcPolicy{option});
+    option.mode = gc::GcMode::INCREMENTAL;
+    bench(GcPolicy{option});
+    option.mode = gc::GcMode::CONCURRENT;
+    bench(GcPolicy{option});
+}
+
+void bench_short_lived_frequent_update() {
+    printf("Running bench_short_lived_frequent_update\n");
+    auto bench = []<class C>(C policy) {
+        // gc::GcOption option{};
+        // option.mode = mode;
+        // option.max_heap_size = 1024 * 64;
+        // gc::GcHeap::init(option);
+        Rng rng(0);
+        policy.init();
+        StatsTracker tracker;
+        auto f = [&] {
+            for (auto j = 0; j < 400; j++) {
+                auto n = 100;
+                auto root = C::template make<Node<C, int>>();
+                auto time = std::chrono::high_resolution_clock::now();
+                for (int i = 0; i < n; i++) {
+                    auto node = C::template make<Node<C, int>>();
+                    node->val = i;
+
+                    root->children->push_back(node);
+                }
+                for (int i = 0; i < n; i++) {
+                    auto i0 = rng.pcg32() % n;
+                    auto i1 = rng.pcg32() % n;
+                    if (i0 == i1) {
+                        continue;
+                    }
+                    typename C::template Owned<Node<C, int>> tmp = root->children->at(i0);
+                    root->children->at(i0) = root->children->at(i1);
+                    root->children->at(i1) = tmp;
+                }
+                int sum = 0;
+                for (int i = 0; i < n; i++) {
+                    sum += root->children->at(i)->val;
+                    // std::printf("i=%d,node->val=%d\n", i, root->children->at(i)->val);
+                    //   std::printf("%lld %p\n",root->children->at(i).control_block_->ref_count, static_cast<void *>(root->children->at(i).control_block_));
+                }
+                // std::printf("sum = %d\n", sum);
+                GC_ASSERT(sum == (n - 1) * n / 2, "invalid sum");
+
+                // std::printf("%lld %p\n", root.control_block_->ref_count, static_cast<void *>(root.control_block_));
+
+                auto elapsed = std::chrono::high_resolution_clock::now() - time;
+                tracker.update(static_cast<double>(elapsed.count()) * 1e-3);
+                // std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        };
+        printf("benchmarking %s\n", policy.name().c_str());
+        f();
+        tracker = StatsTracker{};
+        f();
+        printf("mean = %f\n", tracker.mean);
+        printf("max = %f\n", tracker.max);
+        printf("min = %f\n", tracker.min);
+        printf("variance = %f\n", tracker.variance());
+        // gc::GcHeap::destroy();
+        policy.finalize();
+    };
+    bench(RcPolicy<rc::RefCounter>{});
+    bench(RcPolicy<rc::AtomicRefCounter>{});
+    gc::GcOption option{};
+    option.max_heap_size = 1024 * 16;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::INCREMENTAL;
@@ -307,8 +377,70 @@ void bench_random_graph_large() {
 //     }
 //     // }
 // }
+void test_concurrent_gc_multithread() {
+    gc::GcOption option{};
+    option.mode = gc::GcMode::CONCURRENT;
+    option.max_heap_size = 1024 * 1024 * 256;
+    gc::GcHeap::init(option);
+    {
+        std::vector<std::thread> threads;
+        using NodeT = Node<GcPolicy, int>;
+        auto shared_root = gc::Local<NodeT>::make();
+        auto m = 8192;
+        for (int i = 0; i < m; i++) {
+            auto node = gc::Local<NodeT>::make();
+            node->val = i;
+            shared_root->children->push_back(node);
+        }
+        for (auto i = 0; i < 4; i++) {
+            threads.emplace_back([i, shared_root, m] {
+                Rng rng(i);
+                for (auto j = 0; j < 25; j++) {
+                    auto root = gc::Local<NodeT>::make();
+                    auto n = 32768;
+                    for (int i = 0; i < n; i++) {
+                        auto node = gc::Local<NodeT>::make();
+                        node->val = i;
+                        root->children->push_back(node);
+                    }
+                    auto random_walk = [&](gc::GcPtr<NodeT> node) -> gc::GcPtr<NodeT> {
+                        while (true) {
+                            auto n_children = node->children->size();
+                            if (n_children == 0) {
+                                return node;
+                            }
+                            auto idx = rng.pcg32() % n_children;
+                            node = node->children->at(idx);
+                            auto terminate = rng.pcg32() % 10;
+                            if (terminate == 0) {
+                                return node;
+                            }
+                        }
+                    };
+                    for (auto i = 0; i < 65536; i++) {
+                        auto node1 = random_walk(root);
+                        auto node2 = random_walk(root);
+                        node1->children->push_back(node2);
+                    }
+                    root->children->push_back(shared_root);
+                    auto all_nodes = find_all_nodes<GcPolicy>(gc::GcPtr<NodeT>(root));
+                    auto sum = std::accumulate(all_nodes.begin(), all_nodes.end(), 0, [](int acc, auto node) {
+                        return acc + node->val;
+                    });
+                    GC_ASSERT(sum == (n - 1) * n / 2 + (m - 1) * m / 2, "invalid sum");
+                }
+            });
+        }
+        for (auto &t : threads) {
+            t.join();
+        }
+    }
+    gc::GcHeap::destroy();
+}
 int main() {
-    bench_allocation();
-    bench_random_graph_large();
+    // bench_short_lived_few_update();
+    // bench_short_lived_frequent_update();
+    // bench_random_graph_large();
+    test_concurrent_gc_multithread();
     return 0;
 }
