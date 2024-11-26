@@ -47,9 +47,9 @@ template<typename C, typename T>
 struct Node : public C::template Enable<Node<C, T>> {
     // IMPORT_TYPES()
     T val{};
-    C::template Member<C::template Array<Node<C, T>>> children;
+    C::template Member<typename C::template Array<Node<C, T>>> children;
     Node() : children(this) {
-        children = C::template make<C::template Array<Node<C, T>>>();
+        children = C::template make<typename C::template Array<Node<C, T>>>();
     }
     GC_CLASS(children)
 };

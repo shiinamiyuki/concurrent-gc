@@ -55,7 +55,7 @@ struct RcPolicy {
 
     template<class T, class... Args>
     static Owned<T> make(Args &&...args) {
-        return Owned<T>(Owned<T>::init_t(), std::forward<Args>(args)...);
+        return Owned<T>(typename Owned<T>::init_t{}, std::forward<Args>(args)...);
     }
     std::string name() const {
         if constexpr (std::is_same_v<CounterPolicy, rc::RefCounter>) {

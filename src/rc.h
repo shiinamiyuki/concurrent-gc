@@ -53,7 +53,7 @@ struct RcPtr {
     template<class... Args>
     explicit RcPtr(init_t, Args &&...args) {
         auto alloc = std::pmr::polymorphic_allocator(CounterPolicy::resource.get());
-        control_block_ = alloc.allocate_object<ControlBlock>(1);
+        control_block_ = alloc.template allocate_object<ControlBlock>(1);
         alloc.construct(control_block_, std::forward<Args>(args)...);
         // std::printf("created control block: %p\n", static_cast<void *>(control_block_));
         control_block_->ref_count.inc();
@@ -128,7 +128,7 @@ private:
     cb_t *control_block_;
 protected:
     RcPtr<T, CounterPolicy> rc_from_this() {
-        auto ptr = RcPtr<T, CounterPolicy>;
+        auto ptr = RcPtr<T, CounterPolicy>();
         ptr.control_block_ = control_block_;
         if (control_block_) {
             control_block_->ref_count.inc();
