@@ -356,7 +356,7 @@ void bench_random_graph_large() {
 void test_concurrent_gc_multithread() {
     gc::GcOption option{};
     option.mode = gc::GcMode::CONCURRENT;
-    option.max_heap_size = 1024 * 1024 * 256;
+    option.max_heap_size = 1024 * 1024 * 512;
     gc::GcHeap::init(option);
     {
         std::vector<std::thread> threads;
@@ -437,7 +437,7 @@ int main() {
     // bench_short_lived_few_update();
     // bench_short_lived_frequent_update();
     // bench_random_graph_large();
-    // test_concurrent_gc_multithread();
-    test_hashmap();
+    test_concurrent_gc_multithread();
+    // test_hashmap();
     return 0;
 }

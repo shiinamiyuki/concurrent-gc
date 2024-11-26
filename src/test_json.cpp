@@ -7,6 +7,7 @@
 #include <sstream>
 #include <format>
 #include <fstream>
+#include <cmath>
 template<class C>
 struct JsonValue;
 template<class C>
@@ -37,11 +38,11 @@ struct JsonValue : gc::GarbageCollected<JsonValueBase<C>>, JsonValueBase<C> {
     explicit JsonValue(double v) : Base(v) {}
     explicit JsonValue(const std::string &v) : Base(v) {}
     explicit JsonValue(const typename C::template Ptr<JsonDict<C>> &v) : Base(std::monostate{}) {
-        auto &dict = Base::template emplace<C::template Member<JsonDict<C>>>(this);
+        auto &dict = Base::template emplace<typename C::template Member<JsonDict<C>>>(this);
         dict = v;
     }
     explicit JsonValue(const typename C::template Ptr<JsonArray<C>> &v) : Base(std::monostate{}) {
-        auto &array = Base::template emplace<C::template Member<JsonArray<C>>>(this);
+        auto &array = Base::template emplace<typename C::template Member<JsonArray<C>>>(this);
         array = v;
     }
     static JsonValue array() {
@@ -352,7 +353,7 @@ int main() {
             // download from https://github.com/json-iterator/test-data/blob/master/large-file.json
             std::ifstream ifs("large-file.json");
             if (!ifs) {
-                std::cerr << "Failed to open file large-file.json, please download from https://github.com/json-iterator/test-data/blob/master/large-file.json" << std::endl;
+                std::cerr << "Failed to open file large-file.json, please download from https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json" << std::endl;
                 std::exit(1);
             }
             auto t = std::chrono::high_resolution_clock::now();

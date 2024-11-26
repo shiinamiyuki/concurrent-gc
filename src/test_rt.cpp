@@ -2,6 +2,7 @@
 #include "gc.h"
 #include "rc.h"
 #include <span>
+#include <cmath>
 struct Vec3 {
     double x, y, z;
     Vec3(double x, double y, double z) : x(x), y(y), z(z) {}
