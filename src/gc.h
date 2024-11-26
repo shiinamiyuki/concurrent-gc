@@ -57,15 +57,19 @@ inline void pause_thread() {
 // // mutex helps catching reentrant lock
 // using spin_lock = std::mutex;
 // #else
-struct spin_lock {// https://rigtorp.se/spinlock/
+struct spin_lock {
     std::atomic<bool> lock_ = false;
     void lock() {
         for (;;) {
             if (!lock_.exchange(true, std::memory_order_acquire)) {
                 break;
             }
+            auto i = 1;
             while (lock_.load(std::memory_order_relaxed)) {
-                pause_thread();
+                for(auto j = 0; j < i; j++) {
+                    detail::pause_thread();
+                }
+                i *= 2;
             }
         }
     }
