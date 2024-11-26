@@ -59,7 +59,6 @@ struct RcPtr {
         control_block_->ref_count.inc();
         if constexpr (std::is_base_of_v<RcFromThis<T, CounterPolicy>, T>) {
             control_block_->ptr.control_block_ = control_block_;
-          
         }
     }
     RcPtr(const RcPtr &other) : control_block_(other.control_block_) {
@@ -76,8 +75,8 @@ struct RcPtr {
         return *this;
     }
     template<typename U = void>
-        requires std::is_base_of_v<RcFromThis<T, CounterPolicy>, T>
     RcPtr &operator=(T *ptr) {
+        static_assert(std::is_base_of_v<RcFromThis<T, CounterPolicy>, T>, "T should be derived from RcFromThis");
         auto rc = ptr->rc_from_this();
         *this = rc;
         return *this;
@@ -114,12 +113,15 @@ struct RcPtr {
     T &operator*() const {
         return control_block_->ptr;
     }
+    T *get() const {
+        return &control_block_->ptr;
+    }
     ~RcPtr() {
         dec();
     }
 };
 
-template<class T, class CounterPolicy = RefCounter>
+template<class T, class CounterPolicy>
 struct RcFromThis {
     template<typename U, typename V>
     friend struct RcPtr;
@@ -139,31 +141,30 @@ protected:
     }
 };
 
-template<class T, class CounterPolicy = RefCounter>
+template<class T, class CounterPolicy>
 struct DummyMember : public RcPtr<T, CounterPolicy> {
     template<class U>
     DummyMember(U *_parent) {}
     using Base = RcPtr<T, CounterPolicy>;
     DummyMember(const DummyMember &other) = delete;
     DummyMember(DummyMember &&other) = delete;
-    DummyMember &operator=(const DummyMember &other) {
+    DummyMember &operator=(const DummyMember &other) = delete;
+    DummyMember &operator=(DummyMember &&other) = delete;
+    DummyMember &operator=(T *ptr) {
+        Base::operator=(ptr);
+        return *this;
+    }
+
+    DummyMember &operator=(const RcPtr<T, CounterPolicy> &other) {
         Base::operator=(other);
         return *this;
     }
-    DummyMember &operator=(DummyMember &&other) {
+    DummyMember &operator=(RcPtr<T, CounterPolicy> &&other) {
         Base::operator=(std::move(other));
         return *this;
     }
     DummyMember &operator=(std::nullptr_t) {
         Base::operator=(nullptr);
-        return *this;
-    }
-    DummyMember &operator=(Base &&other) {
-        Base::operator=(std::move(other));
-        return *this;
-    }
-    DummyMember &operator=(const Base &other) {
-        Base::operator=(other);
         return *this;
     }
 };

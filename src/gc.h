@@ -301,18 +301,23 @@ public:
     }
     ~Traceable() {}
 };
+// this is just a dummy class to allow us to use the same interface as rc
 template<class T>
 class GarbageCollected : public Traceable {};
 
-#define GC_CLASS(...)                                  \
-    void trace(const gc::Tracer &tracer) const {       \
-        tracer(__VA_ARGS__);                           \
-    }                                                  \
-    size_t object_size() const {                       \
-        return sizeof(*this);                          \
-    }                                                  \
-    size_t object_alignment() const {                  \
-        return alignof(std::decay_t<decltype(*this)>); \
+#define GC_CLASS(...)                                   \
+    void trace(const gc::Tracer &tracer) const {        \
+        tracer(__VA_ARGS__);                            \
+    }                                                   \
+    size_t object_size() const {                        \
+        return sizeof(*this);                           \
+    }                                                   \
+    size_t object_alignment() const {                   \
+        return alignof(std::decay_t<decltype(*this)>);  \
+    }                                                   \
+    auto gc_ptr_from_this() {                           \
+        using SelfType = std::decay_t<decltype(*this)>; \
+        return gc::GcPtr<SelfType>(this);               \
     }
 
 enum class GcMode : uint8_t {
@@ -838,16 +843,20 @@ class GcPtr {
     friend class Local;
     template<class U>
     friend class Member;
+    template<class U>
+    friend class GarbageCollected;
     // here is the traceable implementation
     T *container_;
     template<class U>
     friend struct apply_trace;
-    explicit GcPtr(T *container_) : container_(container_) {}
-    GcPtr() : container_(nullptr) {}
+
+
+public:
     void reset() {
         container_ = nullptr;
     }
-public:
+    GcPtr() : container_(nullptr) {}
+    explicit GcPtr(T *container_) : container_(container_) {}
     T *operator->() const {
         detail::check_alive(container_);
         return static_cast<T *>(container_);
@@ -871,6 +880,9 @@ public:
     std::optional<RootSet::Node> &root_node() const {
         static_assert(std::is_base_of_v<GcObjectContainer, T>, "T should be a subclass of GcObjectContainer");
         return container_->root_node;
+    }
+    operator bool() const {
+        return container_ != nullptr;
     }
 };
 template<class T>
@@ -1079,6 +1091,9 @@ public:
     operator GcPtr<T>() const {
         return ptr_;
     }
+    operator bool() const {
+        return ptr_ != nullptr;
+    }
     GcPtr<T> get() const {
         return ptr_;
     }
@@ -1160,6 +1175,39 @@ class GcVector : public Traceable {
         data_ = new_data;
     }
 public:
+    struct Iter : public GarbageCollected<Iter> {
+        Member<GcVector<T>> vec_;
+        size_t idx_;
+        Iter(GcPtr<GcVector<T>> vec, size_t idx) : vec_(this), idx_(idx) {
+            vec_ = vec;
+        }
+        GC_CLASS(vec_)
+        Member<T> &operator*() {
+            return (*vec_)[idx_];
+        }
+        Iter &operator++() {
+            idx_++;
+            return *this;
+        }
+
+        Iter operator++(int) {
+            Iter temp(vec_, idx_);
+            idx_++;
+            return temp;
+        }
+        bool operator!=(const Iter &other) const {
+            return idx_ != other.idx_;
+        }
+        bool operator==(const Iter &other) const {
+            return idx_ == other.idx_;
+        }
+    };
+    Iter begin() {
+        return Iter(gc_ptr_from_this(), 0);
+    }
+    Iter end() {
+        return Iter(gc_ptr_from_this(), size_);
+    }
     size_t capacity() const {
         return data_->size();
     }
@@ -1190,11 +1238,152 @@ public:
     }
     GC_CLASS(data_)
 };
-
+template<class K, class V>
+class GcHashMap : public GarbageCollected<GcHashMap<K, V>> {
+    struct Bucket : public Traceable {
+        Member<K> key;
+        Member<V> value;
+        Member<Bucket> next;
+        GC_CLASS(key, value, next)
+        Bucket() : key(this), value(this), next(this) {}
+    };
+    Member<GcArray<Bucket>> data_;
+    size_t total_size_ = 0;
+    double load_factor() const {
+        return static_cast<double>(total_size_) / data_->size();
+    }
+    void rehash() {
+        auto new_hashmap = Local<GcHashMap<K, V>>::make(data_->size() * 2);
+        for (auto [k, v] : *this) {
+            new_hashmap->insert(k, v);
+        }
+        data_ = new_hashmap->data_;
+    }
+public:
+    size_t size() const {
+        return total_size_;
+    }
+    struct Iter : public GarbageCollected<Iter> {
+        Member<GcHashMap<K, V>> map_;
+        size_t idx_;
+        Member<Bucket> current_;
+        GC_CLASS(map_, current_)
+        Iter(GcPtr<GcHashMap<K, V>> map, size_t idx, GcPtr<Bucket> current) : map_(this), idx_(idx), current_(this) {
+            map_ = map;
+            current_ = current;
+        }
+        std::pair<GcPtr<K>, GcPtr<V>> operator*() {
+            GC_ASSERT(current_, "Invalid iterator");
+            return {current_->key, current_->value};
+        }
+        void advance() {
+            if (current_ == nullptr) {
+                return;
+            }
+            if (current_->next) {
+                current_ = current_->next;
+                return;
+            }
+            for (size_t i = idx_ + 1; i < map_->data_->size(); i++) {
+                if ((*map_->data_)[i]) {
+                    idx_ = i;
+                    current_ = (*map_->data_)[i];
+                    return;
+                }
+            }
+            current_ = nullptr;
+        }
+        bool operator!=(const Iter &other) const {
+            return current_ != other.current_;
+        }
+        Iter &operator++() {
+            advance();
+            return *this;
+        }
+        Iter operator++(int) {
+            Iter temp = *this;
+            advance();
+            return temp;
+        }
+    };
+    Iter begin() {
+        for (size_t i = 0; i < data_->size(); i++) {
+            if ((*data_)[i]) {
+                return Iter(gc_ptr_from_this(), i, (*data_)[i]);
+            }
+        }
+        return end();
+    }
+    Iter end() {
+        return Iter(gc_ptr_from_this(), std::numeric_limits<size_t>::max(), GcPtr<Bucket>(nullptr));
+    }
+    GcHashMap(size_t hash_size = 64) : data_(this) {
+        data_ = Local<GcArray<Bucket>>::make(hash_size);
+    }
+    void insert(std::pair<gc::GcPtr<K>, gc::GcPtr<V>> pair) {
+        insert(pair.first, pair.second);
+    }
+    void insert(gc::GcPtr<K> key, gc::GcPtr<V> value) {
+        auto idx = bucket_index(key);
+        Member<Bucket> &bucket = (*data_)[idx];
+        GcPtr<Bucket> current = bucket;
+        while (current) {
+            if (current->key == key) {
+                current->value = value;
+                return;
+            }
+            current = current->next;
+        }
+        auto new_bucket = Local<Bucket>::make();
+        new_bucket->key = key;
+        new_bucket->value = value;
+        new_bucket->next = bucket;
+        bucket = new_bucket;
+        total_size_++;
+        if (load_factor() > 0.75) {
+            rehash();
+        }
+    }
+    bool contains(gc::GcPtr<K> key) {
+        auto idx = bucket_index(key);
+        Member<Bucket> &bucket = (*data_)[idx];
+        GcPtr<Bucket> current = bucket;
+        while (current) {
+            if (current->key == key) {
+                return true;
+            }
+            current = current->next;
+        }
+        return false;
+    }
+    gc::GcPtr<V> at(gc::GcPtr<K> key) {
+        auto idx = bucket_index(key);
+        auto &bucket = (*data_)[idx];
+        auto current = bucket;
+        while (current) {
+            if (current->key == key) {
+                return current->value;
+            }
+            current = current->next;
+        }
+        GC_ASSERT(false, "Key not found");
+    }
+    GC_CLASS(data_)
+private:
+    size_t bucket_index(gc::GcPtr<K> key) {
+        return std::hash<K>{}(*key.get()) % data_->size();
+    }
+};
 }// namespace gc
 template<class T>
 struct std::hash<gc::GcPtr<T>> {
     size_t operator()(const gc::GcPtr<T> &ptr) const {
         return std::hash<const gc::GcObjectContainer *>()(ptr.gc_object_container());
+    }
+};
+template<class T>
+struct std::hash<gc::Adaptor<T>> {
+    size_t operator()(const gc::Adaptor<T> &obj) const {
+        return std::hash<T>{}(obj);
     }
 };

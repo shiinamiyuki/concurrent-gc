@@ -14,6 +14,9 @@ struct GcPolicy {
     template<class T>
     using Enable = gc::GarbageCollected<T>;
 
+    template<class K, class V>
+    using HashMap = gc::GcHashMap<K, V>;
+
     gc::GcOption option{};
     void init() {
         gc::GcHeap::init(option);
@@ -32,6 +35,28 @@ struct GcPolicy {
         return ss.str();
     }
 };
+template<class T, class CounterPolicy>
+struct RcHasher {
+    size_t operator()(const rc::RcPtr<T, CounterPolicy> &ptr) const {
+        return std::hash<T>()(*ptr);
+    }
+};
+template<class T, class CounterPolicy>
+struct RcEqual {
+    bool operator()(const rc::RcPtr<T, CounterPolicy> &lhs, const rc::RcPtr<T, CounterPolicy> &rhs) const {
+        return *lhs == *rhs;
+    }
+};
+template<class T, class CounterPolicy>
+struct RcVec : public rc::RcFromThis<RcVec<T, CounterPolicy>, CounterPolicy>, std::pmr::vector<rc::RcPtr<T, CounterPolicy>> {
+    using Base = std::pmr::vector<rc::RcPtr<T, CounterPolicy>>;
+    using Base::Base;
+};
+template<class K, class V, class CounterPolicy>
+struct RcHashMap : public rc::RcFromThis<RcHashMap<K, V, CounterPolicy>, CounterPolicy>, std::pmr::unordered_map<rc::RcPtr<K, CounterPolicy>, rc::RcPtr<V, CounterPolicy>, RcHasher<K, CounterPolicy>, RcEqual<K, CounterPolicy>> {
+    using Base = std::pmr::unordered_map<rc::RcPtr<K, CounterPolicy>, rc::RcPtr<V, CounterPolicy>, RcHasher<K, CounterPolicy>, RcEqual<K, CounterPolicy>>;
+    using Base::Base;
+};
 template<class CounterPolicy>
 struct RcPolicy {
     template<class T>
@@ -41,9 +66,12 @@ struct RcPolicy {
     template<class T>
     using Member = rc::DummyMember<T, CounterPolicy>;
     template<class T>
-    using Array = std::pmr::vector<rc::RcPtr<T, CounterPolicy>>;
+    using Array = RcVec<T, CounterPolicy>;
     template<class T>
-    using Enable = rc::RcFromThis<T>;
+    using Enable = rc::RcFromThis<T, CounterPolicy>;
+
+    template<class K, class V>
+    using HashMap = RcHashMap<K, V, CounterPolicy>;
 
     std::pmr::memory_resource *old_resource{};
     void init() {
@@ -66,14 +94,39 @@ struct RcPolicy {
     }
 };
 
-#define IMPORT_TYPES()                          \
-    template<class U>                           \
-    using Ptr = typename U::template Ptr<U>;       \
-    template<class U>                           \
+#define IMPORT_TYPES()                              \
+    template<class U>                               \
+    using Ptr = typename U::template Ptr<U>;        \
+    template<class U>                               \
     using Owned = typename U::template Ownedr<U>;   \
-    template<class U>                           \
+    template<class U>                               \
     using Member = typename U::template Memberr<U>; \
-    template<class U>                           \
+    template<class U>                               \
     using Array = typename U::template Arrayr<U>;   \
-    template<class U>                           \
+    template<class U>                               \
     using Enable = typename U::template Enabler<U>;
+
+// https://en.wikipedia.org/wiki/Permuted_congruential_generator
+struct Rng {
+    uint64_t state = 0x4d595df4d0f33173;// Or something seed-dependent
+    uint64_t const multiplier = 6364136223846793005u;
+    uint64_t const increment = 1442695040888963407u;// Or an arbitrary odd constant
+
+    uint32_t rotr32(uint32_t x, unsigned r) {
+        return x >> r | x << (-r & 31);
+    }
+
+    uint32_t pcg32() {
+        uint64_t x = state;
+        unsigned count = (unsigned)(x >> 59);// 59 = 64 - 5
+
+        state = x * multiplier + increment;
+        x ^= x >> 18;                             // 18 = (64 - 27)/2
+        return rotr32((uint32_t)(x >> 27), count);// 27 = 32 - 5
+    }
+
+    Rng(uint64_t seed) {
+        state = seed + increment;
+        (void)pcg32();
+    }
+};

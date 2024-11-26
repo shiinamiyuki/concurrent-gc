@@ -1,3 +1,4 @@
+project(current-gc)
 cmake_minimum_required(VERSION 3.26)
 set(CMAKE_CXX_STANDARD 23)
 # enable LTO
@@ -22,3 +23,7 @@ target_link_libraries(test gc)
 add_executable(test_json src/test_json.cpp)
 set_property(TARGET test_json PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 target_link_libraries(test_json gc)
+
+add_executable(test_raytrace src/test_rt.cpp)
+set_property(TARGET test_raytrace PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+target_link_libraries(test_raytrace gc)

@@ -133,7 +133,7 @@ void GcHeap::concurrent_collector() {
             // marking only acquire lock on the work list
             // but not the pool. at this time, the mutator can still allocate and push stuff to the pool
             // what do we do?
-            while (mark_some(64)) {}
+            while (mark_some(10)) {}
             pool_.with([&](Pool &pool, auto *lock) {
                 GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
                 pool.concurrent_state = ConcurrentState::ATOMIC_MARKING;

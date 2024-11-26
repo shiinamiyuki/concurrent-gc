@@ -6,13 +6,13 @@
 #include <chrono>
 #include "test_common.h"
 using StatsTracker = gc::StatsTracker;
-struct Bar : gc::Traceable {
+struct Bar : gc::GarbageCollected<Bar> {
     int val;
     explicit Bar(int val = 0) : val(val) {}
     GC_CLASS()
 };
 
-struct Foo : gc::Traceable {
+struct Foo : gc::GarbageCollected<Foo> {
     gc::Member<Bar> bar;
     gc::Member<gc::Adaptor<std::string>> s;
     gc::Member<Foo> foo;
@@ -126,30 +126,6 @@ void test_wb() {
         }
     }
 }
-// https://en.wikipedia.org/wiki/Permuted_congruential_generator
-struct Rng {
-    uint64_t state = 0x4d595df4d0f33173;// Or something seed-dependent
-    uint64_t const multiplier = 6364136223846793005u;
-    uint64_t const increment = 1442695040888963407u;// Or an arbitrary odd constant
-
-    uint32_t rotr32(uint32_t x, unsigned r) {
-        return x >> r | x << (-r & 31);
-    }
-
-    uint32_t pcg32() {
-        uint64_t x = state;
-        unsigned count = (unsigned)(x >> 59);// 59 = 64 - 5
-
-        state = x * multiplier + increment;
-        x ^= x >> 18;                             // 18 = (64 - 27)/2
-        return rotr32((uint32_t)(x >> 27), count);// 27 = 32 - 5
-    }
-
-    Rng(uint64_t seed) {
-        state = seed + increment;
-        (void)pcg32();
-    }
-};
 
 void bench_short_lived_few_update() {
     printf("Running bench_short_lived_few_update\n");
@@ -437,10 +413,31 @@ void test_concurrent_gc_multithread() {
     }
     gc::GcHeap::destroy();
 }
+void test_hashmap() {
+    gc::GcOption option{};
+    option.mode = gc::GcMode::STOP_THE_WORLD;
+    option.max_heap_size = 1024 * 1024 * 256;
+    gc::GcHeap::init(option);
+    using Map = gc::GcHashMap<gc::Adaptor<std::string>, gc::Adaptor<std::string>>;
+    {
+        auto map = gc::Local<Map>::make();
+        for (int i = 0; i < 100; i++) {
+            auto s = gc::Local<gc::Adaptor<std::string>>::make(std::to_string(i));
+            map->insert(s, s);
+            GC_ASSERT(map->contains(s), "should contain");
+        }
+        printf("map.size() = %lld\n", map->size());
+        for (auto [k, v] : *map) {
+            printf("%s %s\n", k->c_str(), v->c_str());
+        }
+    }
+    gc::GcHeap::destroy();
+}
 int main() {
     // bench_short_lived_few_update();
     // bench_short_lived_frequent_update();
     // bench_random_graph_large();
-    test_concurrent_gc_multithread();
+    // test_concurrent_gc_multithread();
+    test_hashmap();
     return 0;
 }
