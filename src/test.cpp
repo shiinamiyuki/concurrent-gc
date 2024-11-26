@@ -43,25 +43,27 @@ void test_random() {
     }
     // }
 }
-template<typename T>
-struct Node : public gc::Traceable {
+template<typename C, typename T>
+struct Node : public C::template Enable<Node<C, T>> {
+    // IMPORT_TYPES()
     T val{};
-    gc::Member<gc::GcVector<Node<T>>> children;
+    C::template Member<C::template Array<Node<C, T>>> children;
     Node() : children(this) {
-        children = gc::Local<gc::GcVector<Node<T>>>::make();
+        children = C::template make<C::template Array<Node<C, T>>>();
     }
     GC_CLASS(children)
 };
-template<typename T>
-auto find_all_nodes(gc::GcPtr<Node<T>> root) {
-    std::vector<gc::GcPtr<Node<T>>> nodes;
-    std::unordered_set<Node<T> *>
+template<typename C, typename T>
+auto find_all_nodes(typename C::template Ptr<Node<C, T>> root) {
+    std::vector<typename C::template Ptr<Node<C, T>>> nodes;
+    std::unordered_set<typename C::template Ptr<Node<C, T>>>
         visited;
-    std::function<void(gc::GcPtr<Node<T>>)> dfs = [&](gc::GcPtr<Node<T>> node) {
-        if (visited.contains(node.get())) {
+    using N = C::template Ptr<Node<C, T>>;
+    std::function<void(N)> dfs = [&](C::template Ptr<Node<C, T>> node) {
+        if (visited.contains(node)) {
             return;
         }
-        visited.insert(node.get());
+        visited.insert(node);
         nodes.push_back(node);
         auto num_children = node->children->size();
         for (auto i = 0; i < num_children; i++) {
@@ -151,27 +153,40 @@ struct Rng {
 
 void bench_allocation() {
     printf("Running allocation benchmark\n");
-    auto bench = [](gc::GcMode mode) {
-        gc::GcOption option{};
-        option.mode = mode;
-        option.max_heap_size = 1024 * 64;
-        gc::GcHeap::init(option);
+    auto bench = []<class C>(C policy) {
+        // gc::GcOption option{};
+        // option.mode = mode;
+        // option.max_heap_size = 1024 * 64;
+        // gc::GcHeap::init(option);
+
+        policy.init();
         StatsTracker tracker;
         auto f = [&] {
             for (auto j = 0; j < 400; j++) {
-                gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
+                auto root = C::template make<Node<C, int>>();
                 auto time = std::chrono::high_resolution_clock::now();
-                for (int i = 0; i < 20; i++) {
-                    auto node = gc::Local<Node<int>>::make();
+                for (int i = 0; i < 100; i++) {
+                    auto node = C::template make<Node<C, int>>();
                     node->val = i;
+
                     root->children->push_back(node);
                 }
+                int sum = 0;
+                for (int i = 0; i < 100; i++) {
+                    sum += root->children->at(i)->val;
+                    // std::printf("i=%d,node->val=%d\n", i, root->children->at(i)->val);
+                    //   std::printf("%lld %p\n",root->children->at(i).control_block_->ref_count, static_cast<void *>(root->children->at(i).control_block_));
+                }
+                GC_ASSERT(sum == 4950, "invalid sum");
+                // std::printf("sum = %d\n", sum);
+                // std::printf("%lld %p\n", root.control_block_->ref_count, static_cast<void *>(root.control_block_));
+
                 auto elapsed = std::chrono::high_resolution_clock::now() - time;
                 tracker.update(static_cast<double>(elapsed.count()) * 1e-3);
                 // std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         };
-        printf("benchmarking %s\n", gc::to_string(mode));
+        printf("benchmarking %s\n", policy.name().c_str());
         f();
         tracker = StatsTracker{};
         f();
@@ -179,52 +194,24 @@ void bench_allocation() {
         printf("max = %f\n", tracker.max);
         printf("min = %f\n", tracker.min);
         printf("variance = %f\n", tracker.variance());
-        gc::GcHeap::destroy();
+        // gc::GcHeap::destroy();
+        policy.finalize();
     };
-    bench(gc::GcMode::STOP_THE_WORLD);
-    bench(gc::GcMode::INCREMENTAL);
-    bench(gc::GcMode::CONCURRENT);
+    bench(RcPolicy<rc::RefCounter>{});
+    bench(RcPolicy<rc::AtomicRefCounter>{});
+    gc::GcOption option{};
+    option.max_heap_size = 1024 * 64;
+    option.mode = gc::GcMode::STOP_THE_WORLD;
+    bench(GcPolicy{option});
+    option.mode = gc::GcMode::INCREMENTAL;
+    bench(GcPolicy{option});
+    option.mode = gc::GcMode::CONCURRENT;
+    bench(GcPolicy{option});
 }
-void bench_allocation_collect() {
-    printf("Running allocation + collect benchmark\n");
-    auto bench = [](gc::GcMode mode) {
-        gc::GcOption option{};
-        option.mode = mode;
-        option.max_heap_size = 1024 * 64;
-        gc::GcHeap::init(option);
-        StatsTracker tracker;
-        auto f = [&] {
-            for (auto j = 0; j < 400; j++) {
-                gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
-                auto time = std::chrono::high_resolution_clock::now();
-                for (int i = 0; i < 20; i++) {
-                    auto node = gc::Local<Node<int>>::make();
-                    node->val = i;
-                    root->children->push_back(node);
-                }
-                // simulate some work
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                auto elapsed = std::chrono::high_resolution_clock::now() - time;
-                tracker.update(static_cast<double>(elapsed.count()) * 1e-3);
-            }
-        };
-        printf("benchmarking %s\n", gc::to_string(mode));
-        f();
-        tracker = StatsTracker{};
-        f();
-        printf("mean = %f\n", tracker.mean);
-        printf("max = %f\n", tracker.max);
-        printf("min = %f\n", tracker.min);
-        printf("variance = %f\n", tracker.variance());
-        gc::GcHeap::destroy();
-    };
-    bench(gc::GcMode::STOP_THE_WORLD);
-    bench(gc::GcMode::INCREMENTAL);
-    bench(gc::GcMode::CONCURRENT);
-}
+
 void bench_random_graph_large() {
     printf("Running random graph benchmark (Large)\n");
-    gc::enable_time_tracking = true;
+    gc::enable_time_tracking = false;
     auto bench = [](gc::GcMode mode) {
         printf("benchmarking %s\n", gc::to_string(mode));
         gc::GcOption option{};
@@ -234,17 +221,17 @@ void bench_random_graph_large() {
         Rng rng(0);
         StatsTracker tracker;
         {
-            std::vector<gc::Local<Node<int>>> presistent_nodes;
-            for (auto j = 0; j < 40; j++) {
+            std::vector<gc::Local<Node<GcPolicy, int>>> presistent_nodes;
+            for (auto j = 0; j < 100; j++) {
                 auto time = std::chrono::high_resolution_clock::now();
-                gc::Local<Node<int>> root = gc::Local<Node<int>>::make();
+                gc::Local<Node<GcPolicy, int>> root = gc::Local<Node<GcPolicy, int>>::make();
                 auto n = 32768;
                 for (int i = 0; i < n; i++) {
-                    auto node = gc::Local<Node<int>>::make();
+                    auto node = gc::Local<Node<GcPolicy, int>>::make();
                     node->val = i;
                     root->children->push_back(node);
                 }
-                auto random_walk = [&](gc::GcPtr<Node<int>> node) -> gc::GcPtr<Node<int>> {
+                auto random_walk = [&](gc::GcPtr<Node<GcPolicy, int>> node) -> gc::GcPtr<Node<GcPolicy, int>> {
                     while (true) {
                         auto n_children = node->children->size();
                         if (n_children == 0) {
@@ -263,7 +250,7 @@ void bench_random_graph_large() {
                     auto node2 = random_walk(root);
                     node1->children->push_back(node2);
                 }
-                auto all_nodes = find_all_nodes(gc::GcPtr<Node<int>>(root));
+                auto all_nodes = find_all_nodes<GcPolicy>(gc::GcPtr<Node<GcPolicy, int>>(root));
                 // printf("all_nodes.size() = %lld\n", all_nodes.size());
                 auto sum = std::accumulate(all_nodes.begin(), all_nodes.end(), 0, [](int acc, auto node) {
                     return acc + node->val;
@@ -285,7 +272,9 @@ void bench_random_graph_large() {
         }
         printf("total time = %f\n", tracker.mean * tracker.count);
         tracker.print("bench random_graph");
-        gc::get_heap().stats().print();
+        if (gc::enable_time_tracking) {
+            gc::get_heap().stats().print();
+        }
         gc::GcHeap::destroy();
     };
     bench(gc::GcMode::STOP_THE_WORLD);
@@ -320,7 +309,6 @@ void bench_random_graph_large() {
 // }
 int main() {
     bench_allocation();
-    bench_allocation_collect();
     bench_random_graph_large();
     return 0;
 }

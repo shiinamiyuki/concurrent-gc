@@ -43,9 +43,12 @@ void GcHeap::do_concurrent(size_t inc_size) {
             return pool.allocation_size_ + inc_size < max_heap_size_;
         };
         auto threshold = [&]() -> bool {
-            auto now = std::chrono::high_resolution_clock::now();
-            auto since_last_collection = now - stats_.last_collect_time;
-            return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected && since_last_collection > std::chrono::seconds(1);
+            auto time_threshold = [&]() {
+                auto now = std::chrono::high_resolution_clock::now();
+                auto since_last_collection = now - stats_.last_collect_time;
+                return since_last_collection > std::chrono::seconds(1);
+            };
+            return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected && time_threshold();
         };
         stats_.wait_for_atomic_marking += time_function([&] {
             while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {

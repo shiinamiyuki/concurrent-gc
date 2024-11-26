@@ -205,7 +205,7 @@ struct TracingContext {
 };
 template<class T>
 struct apply_trace {
-    void operator()(TracingContext &, const T &) const;
+    void operator()(TracingContext &, const T &) const {}
 };
 struct Tracer {
     TracingContext &cb;
@@ -296,17 +296,19 @@ public:
         return this;
     }
     ~Traceable() {}
-};
+}; 
+template<class T>
+class GarbageCollected : public Traceable {};
 
-#define GC_CLASS(...)                                     \
-    void trace(const gc::Tracer &tracer) const override { \
-        tracer(__VA_ARGS__);                              \
-    }                                                     \
-    size_t object_size() const override {                 \
-        return sizeof(*this);                             \
-    }                                                     \
-    size_t object_alignment() const override {            \
-        return alignof(std::decay_t<decltype(*this)>);    \
+#define GC_CLASS(...)                                  \
+    void trace(const gc::Tracer &tracer) const {       \
+        tracer(__VA_ARGS__);                           \
+    }                                                  \
+    size_t object_size() const {                       \
+        return sizeof(*this);                          \
+    }                                                  \
+    size_t object_alignment() const {                  \
+        return alignof(std::decay_t<decltype(*this)>); \
     }
 
 enum class GcMode : uint8_t {
@@ -347,7 +349,7 @@ struct WorkList {
 struct GcOption {
     GcMode mode = GcMode::INCREMENTAL;
     size_t max_heap_size = 1024 * 1024 * 1024;
-    double gc_threshold = 0.5;// when should a gc be triggered
+    double gc_threshold = 0.8;// when should a gc be triggered
     bool _full_debug = false;
 };
 // namespace detail {
@@ -979,6 +981,9 @@ public:
     const GcObjectContainer *gc_object_container() const {
         return ptr_.gc_object_container();
     }
+    GcPtr<T> get() const {
+        return ptr_;
+    }
 };
 template<class T>
 class Member {
@@ -1053,6 +1058,9 @@ public:
         return ptr_ == nullptr;
     }
     operator GcPtr<T>() const {
+        return ptr_;
+    }
+    GcPtr<T> get() const {
         return ptr_;
     }
 };
@@ -1165,3 +1173,9 @@ public:
 };
 
 }// namespace gc
+template<class T>
+struct std::hash<gc::GcPtr<T>> {
+    size_t operator()(const gc::GcPtr<T> &ptr) const {
+        return std::hash<const gc::GcObjectContainer *>()(ptr.gc_object_container());
+    }
+};
