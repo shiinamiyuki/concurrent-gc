@@ -303,7 +303,7 @@ protected:
     mutable std::atomic<uint8_t> color_ = color::WHITE;
     mutable bool alive = true;
     uint8_t pool_idx_ = 0;
-    mutable uint16_t root_ref_count = 0;
+    mutable std::atomic<uint16_t> root_ref_count = 0;
     /// @brief if we were using rust, the below field might only take 8 bytes...
     mutable std::optional<RootSet::Node> root_node = {};
     mutable GcObjectContainer *next_ = nullptr;
@@ -315,10 +315,10 @@ protected:
         color_.store(value, std::memory_order_relaxed);
     }
     void inc_root_ref_count() const {
-        root_ref_count++;
+        root_ref_count.fetch_add(1, std::memory_order_relaxed);
     }
     void dec_root_ref_count() const {
-        root_ref_count--;
+        root_ref_count.fetch_sub(1, std::memory_order_relaxed);
     }
 public:
     size_t pool_idx() const {
@@ -329,7 +329,7 @@ public:
         return root_node.has_value();
     }
     uint8_t color() const {
-        return color_;
+        return color_.load(std::memory_order_relaxed);
     }
     bool is_alive() const {
         return alive;
