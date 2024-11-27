@@ -35,7 +35,6 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
         auto &concurrent_resources = pool_.get().concurrent_resources;
         auto &lists = object_lists_.get().lists;
         for (auto i = 0; i < option.n_collector_threads.value(); i++) {
-            concurrent_resources.push_back(std::make_unique<std::pmr::unsynchronized_pool_resource>());
             lists.emplace_back(std::move(std::make_unique<ObjectLists::list_t>(ObjectList{}, true)));
         }
 
@@ -118,7 +117,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
             }
         }
         GC_ASSERT(is_mem_available(), "Out of memory");
-    });
+    }, false, true);
 }
 void GcHeap::concurrent_collector() {
     while (!stop_collector_.load(std::memory_order_relaxed)) {
@@ -233,7 +232,7 @@ void GcHeap::scan_roots() {
         }
     });
 }
-std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::sweep_list(ObjectList &object_list) {
+std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::sweep_list(ObjectList &object_list, size_t pool_idx) {
     if constexpr (is_debug) {
         std::printf("sweeping list\n");
     }
@@ -274,7 +273,7 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
             ptr->set_color(color::WHITE);
             ptr = next;
         } else {
-            free_object(ptr);
+            free_object(ptr, pool_idx);
             object_list.count.fetch_sub(1, std::memory_order_relaxed);
             // GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
             if (!prev) {
@@ -327,7 +326,7 @@ void GcHeap::sweep() {
             GC_ASSERT(false, "not implemented");
         } else {
             for (int i = 0; i < object_lists.size(); i++) {
-                auto [collect_cnt, cnt, head, prev] = sweep_list(object_lists[i]);
+                auto [collect_cnt, cnt, head, prev] = sweep_list(object_lists[i], i);
                 stats_.n_collected.fetch_add(collect_cnt, std::memory_order_relaxed);
                 object_lists_.get().lists[i]->with([&](auto &list, auto *lock) {
                     if (prev) {

@@ -12,7 +12,7 @@
 #include <emmintrin.h>
 #include <mutex>
 #include <list>
-#include "heap.h"
+
 static_assert(sizeof(size_t) == 8, "64-bit only");
 #define GC_ASSERT(x, msg)                                    \
     do {                                                     \
@@ -112,6 +112,8 @@ public:
         count = 1;
     }
     void unlock() {
+        auto id = std::this_thread::get_id();
+        GC_ASSERT(id == owner, "Unlocking lock not owned by this thread");
         GC_ASSERT(count > 0, "Unlocking unlocked lock");
         count--;
         if (count == 0) {
@@ -169,31 +171,35 @@ public:
     }
     template<class F>
         requires std::invocable<F, T &, Lock *>
-    auto with(F &&f) -> decltype(auto) {
+    auto with(F &&f, bool no_lock = false, bool no_unlock = false) -> decltype(auto) {
         using R = std::invoke_result_t<F, T &, Lock *>;
-        if (lock_.has_value()) {
+        if (!no_lock && lock_.has_value()) {
             lock_->lock();
         }
         if constexpr (std::is_void_v<R>) {
             f(data, lock_.has_value() ? &lock_.value() : nullptr);
             if (lock_.has_value()) {
-                lock_->unlock();
+                if (!no_unlock) {
+                    lock_->unlock();
+                }
             }
             return;
         } else {
             auto result = f(data, lock_.has_value() ? &lock_.value() : nullptr);
             if (lock_.has_value()) {
-                lock_->unlock();
+                if (!no_unlock) {
+                    lock_->unlock();
+                }
             }
             return result;
         }
     }
     template<class F>
         requires std::invocable<F, T &, Lock *>
-    auto with_timed(F &&f) -> decltype(auto) {
+    auto with_timed(F &&f, bool no_lock = false, bool no_unlock = false) -> decltype(auto) {
         auto lock_time = 0.0;
         using R = std::invoke_result_t<F, T &, Lock *>;
-        if (lock_.has_value()) {
+        if (!no_lock && lock_.has_value()) {
             if (enable_time_tracking) {
                 auto t = std::chrono::steady_clock::now();
                 lock_->lock();
@@ -204,13 +210,13 @@ public:
         }
         if constexpr (std::is_void_v<R>) {
             f(data, lock_.has_value() ? &lock_.value() : nullptr);
-            if (lock_.has_value()) {
+            if (!no_unlock && lock_.has_value()) {
                 lock_->unlock();
             }
             return lock_time;
         } else {
             auto result = f(data, lock_.has_value() ? &lock_.value() : nullptr);
-            if (lock_.has_value()) {
+            if (!no_unlock && lock_.has_value()) {
                 lock_->unlock();
             }
             return std::make_pair(result, lock_time);
@@ -566,6 +572,34 @@ public:
         }
     }
 };
+template<class T>
+struct tracking_memory_resource : std::pmr::memory_resource {
+    std::unique_ptr<std::pmr::memory_resource> inner;
+    T payload;
+    struct Metadata {
+        tracking_memory_resource *self;
+    };
+    tracking_memory_resource(T payload, std::unique_ptr<std::pmr::memory_resource> inner) : payload(std::move(payload)) {
+        inner = std::move(inner);
+    }
+    void *do_allocate(std::size_t bytes, std::size_t alignment) override {
+        auto actual_size = bytes + sizeof(Metadata);
+        auto ptr = reinterpret_cast<uint8_t *>(inner->allocate(actual_size, alignment));
+        auto metadata = new (ptr + bytes) Metadata{this};
+        return ptr;
+    }
+    void do_deallocate(void *p,
+                       std::size_t bytes,
+                       std::size_t alignment) override {
+        auto ptr = static_cast<uint8_t *>(p);
+        auto metadata = reinterpret_cast<Metadata *>(ptr + bytes);
+        GC_ASSERT(metadata->self == this, "Invalid metadata");
+        inner->deallocate(ptr, bytes + sizeof(Metadata), alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
+        return this == &other;
+    }
+};
 class GcHeap {
     friend struct TracingContext;
     template<class T>
@@ -587,18 +621,26 @@ class GcHeap {
     std::optional<ThreadPool> worker_pool_;
     struct Pool {
         size_t allocation_size_ = 0;
-        std::unique_ptr<std::pmr::memory_resource> inner;
-        std::vector<std::unique_ptr<std::pmr::memory_resource>> concurrent_resources;
-        std::optional<std::pmr::polymorphic_allocator<void>> alloc_;
+        // std::unique_ptr<std::pmr::memory_resource> inner;
+        using resouce_t = detail::LockProtected<detail::spin_lock, std::unique_ptr<std::pmr::memory_resource>>;
+        std::vector<std::unique_ptr<resouce_t>> concurrent_resources;
         ConcurrentState concurrent_state = ConcurrentState::IDLE;
         Pool(GcOption option) {
-            if (option._full_debug) {
-                inner = std::make_unique<std::pmr::monotonic_buffer_resource>();
+            auto make = [&]() -> std::unique_ptr<std::pmr::memory_resource> {
+                if (option._full_debug) {
+                    return std::make_unique<std::pmr::monotonic_buffer_resource>();
+                } else {
+                    return std::make_unique<std::pmr::unsynchronized_pool_resource>();
+                    // inner = std::make_unique<RawHeap>();
+                }
+            };
+            if (option.n_collector_threads.has_value()) {
+                for (size_t i = 0; i < option.n_collector_threads.value(); i++) {
+                    concurrent_resources.emplace_back(std::move(std::make_unique<resouce_t>(make(), true)));
+                }
             } else {
-                // inner = std::make_unique<std::pmr::unsynchronized_pool_resource>();
-                inner = std::make_unique<RawHeap>();
+                concurrent_resources.emplace_back(std::move(std::make_unique<resouce_t>(make(), option.mode == GcMode::CONCURRENT)));
             }
-            alloc_.emplace(inner.get());
         }
     };
     GcStats stats_;
@@ -616,28 +658,40 @@ class GcHeap {
     struct ObjectLists {
         using list_t = detail::LockProtected<detail::spin_lock, ObjectList>;
         std::vector<std::unique_ptr<detail::LockProtected<detail::spin_lock, ObjectList>>> lists;
-        void push_to_least_full(GcObjectContainer *ptr) {
-            while (true) {
-                auto min = std::numeric_limits<size_t>::max();
-                size_t idx = 0;
-                for (size_t i = 0; i < lists.size(); i++) {
-                    auto count = lists[i]->get().count.load();
-                    if (count < min) {
-                        min = count;
-                        idx = i;
-                    }
-                }
-                if (lists[idx]->lock_enabled()) {
-                    if (lists[idx]->get_lock().try_lock()) {
-                        lists[idx]->get().insert(ptr);
-                        lists[idx]->get_lock().unlock();
-                        return;
-                    }
-                } else {
-                    lists[idx]->get().insert(ptr);
-                    return;
+        // void push_to_least_full(GcObjectContainer *ptr) {
+        //     while (true) {
+        //         auto min = std::numeric_limits<size_t>::max();
+        //         size_t idx = 0;
+        //         for (size_t i = 0; i < lists.size(); i++) {
+        //             auto count = lists[i]->get().count.load();
+        //             if (count < min) {
+        //                 min = count;
+        //                 idx = i;
+        //             }
+        //         }
+        //         if (lists[idx]->lock_enabled()) {
+        //             if (lists[idx]->get_lock().try_lock()) {
+        //                 lists[idx]->get().insert(ptr);
+        //                 lists[idx]->get_lock().unlock();
+        //                 return;
+        //             }
+        //         } else {
+        //             lists[idx]->get().insert(ptr);
+        //             return;
+        //         }
+        //     }
+        // }
+        size_t least_full_list() {
+            auto min = std::numeric_limits<size_t>::max();
+            size_t idx = 0;
+            for (size_t i = 0; i < lists.size(); i++) {
+                auto count = lists[i]->get().count.load();
+                if (count < min) {
+                    min = count;
+                    idx = i;
                 }
             }
+            return idx;
         }
     };
     GcMode mode_ = GcMode::INCREMENTAL;
@@ -658,7 +712,7 @@ class GcHeap {
         return state_;
     }
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
-    void free_object(GcObjectContainer *ptr) {
+    void free_object(GcObjectContainer *ptr, size_t pool_idx) {
         stats_.n_collected.fetch_add(1, std::memory_order_relaxed);
         stats_.time_waiting_for_pool += pool_.with_timed([&](auto &pool, auto *lock) {
             if constexpr (is_debug) {
@@ -669,7 +723,9 @@ class GcHeap {
             auto size = ptr->object_size();
             auto align = ptr->object_alignment();
             ptr->~GcObjectContainer();
-            pool.alloc_->deallocate_bytes(ptr, size, align);
+            pool.concurrent_resources[pool_idx]->with([&](auto &resource, auto *lock) {
+                resource->deallocate(ptr, size, align);
+            });
         });
     }
     /// @brief `shade` it self do not acquire the lock on work_list
@@ -751,16 +807,27 @@ class GcHeap {
     struct gc_memory_resource : std::pmr::memory_resource {
         GcHeap *heap;
         gc_memory_resource(GcHeap *heap) : heap(heap) {}
+        struct Metadata {
+            size_t pool_idx;
+        };
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
             heap->prepare_allocation(bytes);
+
+            auto pool_idx = std::hash<std::thread::id>{}(std::this_thread::get_id()) % heap->object_lists_.get().lists.size();
             auto [ptr, t] = heap->pool_.with_timed([&](auto &pool, auto *lock) -> void * {
-                pool.allocation_size_ += bytes;
-                auto ptr = pool.inner->allocate(bytes, alignment);
+                pool.allocation_size_ += bytes + sizeof(Metadata);
+                // auto ptr = reinterpret_cast<uint8_t *>(pool.concurrent_resources[pool_idx]->allocate(bytes + sizeof(Metadata), alignment));
+                auto ptr = pool.concurrent_resources[pool_idx]->with([&](auto &resource, auto *lock) {
+                    return reinterpret_cast<uint8_t *>(resource->allocate(bytes + sizeof(Metadata), alignment));
+                });
                 if constexpr (is_debug) {
                     std::printf("Allocating %p, %lld bytes via pmr, %lld/%lldB used\n", ptr, bytes, pool.allocation_size_, heap->max_heap_size_);
                 }
+                Metadata meta{pool_idx};
+                std::memcpy(ptr + bytes, &meta, sizeof(Metadata));
                 return ptr;
-            });
+            },
+                                                   heap->mode() == GcMode::CONCURRENT);
             heap->stats_.time_waiting_for_pool += t;
             return ptr;
         }
@@ -768,11 +835,16 @@ class GcHeap {
                            std::size_t bytes,
                            std::size_t alignment) override {
             heap->stats_.time_waiting_for_pool += heap->pool_.with_timed([&](auto &pool, auto *lock) {
-                pool.allocation_size_ -= bytes;
+                pool.allocation_size_ -= bytes + sizeof(Metadata);
                 if constexpr (is_debug) {
                     std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, pool.allocation_size_, heap->max_heap_size_);
                 }
-                pool.inner->deallocate(p, bytes, alignment);
+                Metadata meta{};
+                std::memcpy(&meta, static_cast<uint8_t *>(p) + bytes, sizeof(Metadata));
+                // pool.concurrent_resources[meta.pool_idx]->deallocate(p, bytes + sizeof(Metadata), alignment);
+                pool.concurrent_resources[meta.pool_idx]->with([&](auto &resource, auto *lock) {
+                    resource->deallocate(p, bytes + sizeof(Metadata), alignment);
+                });
             });
         }
         bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
@@ -829,7 +901,7 @@ public:
             std::fflush(stdout);
         }
         prepare_allocation(sizeof(T));
-
+        size_t pool_idx{};
         auto [ptr, t] = pool_.with_timed([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
                 // GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
@@ -844,16 +916,20 @@ public:
                     }
                 });
             }
+            pool_idx = object_lists_.get().least_full_list();
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
-            auto ptr = pool.alloc_->allocate_object<T>(1);
-            if constexpr (is_debug) {
-                std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_, max_heap_size_);
-                std::fflush(stdout);
-            }
-
-            pool.allocation_size_ += sizeof(T);
-            return ptr;
-        });
+            return pool.concurrent_resources[pool_idx]->with([&](auto &resource, auto *lock) {
+                auto alloc = std::pmr::polymorphic_allocator<T>(resource.get());
+                auto ptr = alloc.allocate_object<T>(1);
+                if constexpr (is_debug) {
+                    std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_, max_heap_size_);
+                    std::fflush(stdout);
+                }
+                pool.allocation_size_ += sizeof(T);
+                return ptr;
+            });
+        },
+                                         mode() == GcMode::CONCURRENT);
         stats_.n_allocated.fetch_add(1, std::memory_order_relaxed);
         stats_.time_waiting_for_pool += t;
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
@@ -887,14 +963,16 @@ public:
                 //     ptr->next_ = list.head;
                 //     list.head = ptr;
                 // }
-                lists.push_to_least_full(ptr);
+                lists.lists[pool_idx]->with([&](auto &list, auto *lock) {
+                    list.insert(ptr);
+                });
             });
         });
         return ptr;
     }
     void collect();
     void sweep();
-    std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> sweep_list(ObjectList &list);
+    std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> sweep_list(ObjectList &list, size_t pool_idx);
     void scan_roots();
     bool mark_some(size_t max_count);
     void add_to_working_list(const GcObjectContainer *ptr) {

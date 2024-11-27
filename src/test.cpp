@@ -154,7 +154,7 @@ void bench_short_lived_few_update() {
                     // std::printf("i=%d,node->val=%d\n", i, root->children->at(i)->val);
                     //   std::printf("%lld %p\n",root->children->at(i).control_block_->ref_count, static_cast<void *>(root->children->at(i).control_block_));
                 }
-                GC_ASSERT(sum == n*(n-1)/2, "invalid sum");
+                GC_ASSERT(sum == n * (n - 1) / 2, "invalid sum");
                 // std::printf("sum = %d\n", sum);
                 // std::printf("%lld %p\n", root.control_block_->ref_count, static_cast<void *>(root.control_block_));
 
@@ -174,8 +174,8 @@ void bench_short_lived_few_update() {
         // gc::GcHeap::destroy();
         policy.finalize();
     };
-    // bench(RcPolicy<rc::RefCounter>{});
-    // bench(RcPolicy<rc::AtomicRefCounter>{});
+    bench(RcPolicy<rc::RefCounter>{});
+    bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
     option.max_heap_size = 1024 * 32;
     option.mode = gc::GcMode::STOP_THE_WORLD;
@@ -357,7 +357,7 @@ void bench_random_graph_large() {
 void test_concurrent_gc_multithread() {
     gc::GcOption option{};
     option.mode = gc::GcMode::CONCURRENT;
-    option.max_heap_size = 1024 * 1024 * 512;
+    option.max_heap_size = 1024 * 1024 * 64;
     gc::GcHeap::init(option);
     {
         std::vector<std::thread> threads;
@@ -374,7 +374,7 @@ void test_concurrent_gc_multithread() {
                 Rng rng(i);
                 for (auto j = 0; j < 25; j++) {
                     auto root = gc::Local<NodeT>::make();
-                    auto n = 32768;
+                    auto n = 8192;
                     for (int i = 0; i < n; i++) {
                         auto node = gc::Local<NodeT>::make();
                         node->val = i;
@@ -412,6 +412,7 @@ void test_concurrent_gc_multithread() {
             t.join();
         }
     }
+    std::printf("multithread test done\n");
     gc::GcHeap::destroy();
 }
 void test_hashmap() {
@@ -432,13 +433,14 @@ void test_hashmap() {
             printf("%s %s\n", k->c_str(), v->c_str());
         }
     }
+
     gc::GcHeap::destroy();
 }
 int main() {
-    bench_short_lived_few_update();
+    // bench_short_lived_few_update();
     // bench_short_lived_frequent_update();
     // bench_random_graph_large();
-    // test_concurrent_gc_multithread();
+    test_concurrent_gc_multithread();
     // test_hashmap();
     return 0;
 }
