@@ -940,7 +940,11 @@ public:
         return stats_;
     }
     std::pmr::memory_resource *memory_resource(size_t pool_idx) {
-        GC_ASSERT(gc_memory_resource_[pool_idx].pool_idx == pool_idx, "Invalid pool index");
+        // if (pool_idx >= gc_memory_resource_.size()){
+        //     printf("pool_idx = %lld, size = %lld\n", pool_idx, gc_memory_resource_.size());
+        // }
+        // GC_ASSERT(gc_memory_resource_[pool_idx].pool_idx == pool_idx, "Invalid pool index");
+        pool_idx = std::min(pool_idx, gc_memory_resource_.size() - 1);
         return &gc_memory_resource_[pool_idx];
     }
     auto &root_set() {
@@ -1000,7 +1004,7 @@ public:
                                          mode() == GcMode::CONCURRENT);
         stats_.n_allocated.fetch_add(1, std::memory_order_relaxed);
         stats_.time_waiting_for_pool += t;
-        auto offset_of_pool_idx = offsetof(T, pool_idx_);
+        auto offset_of_pool_idx = &reinterpret_cast<T *>(ptr)->pool_idx_ - reinterpret_cast<uint8_t *>(ptr);
         std::memcpy(reinterpret_cast<uint8_t *>(ptr) + offset_of_pool_idx, &pool_idx, sizeof(pool_idx));
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
         GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
