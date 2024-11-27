@@ -73,7 +73,9 @@ struct spin_lock {
                 for (auto j = 0; j < i; j++) {
                     detail::pause_thread();
                 }
-                i *= 2;
+                if (i < 8192) {
+                    i *= 2;
+                }
             }
         }
     }
@@ -302,7 +304,7 @@ protected:
     friend class GcHeap;
     mutable std::atomic<uint8_t> color_ = color::WHITE;
     mutable bool alive = true;
-    uint8_t pool_idx_ = 0;
+    uint8_t pool_idx_;
     mutable std::atomic<uint16_t> root_ref_count = 0;
     /// @brief if we were using rust, the below field might only take 8 bytes...
     mutable std::optional<RootSet::Node> root_node = {};
@@ -763,6 +765,8 @@ class GcHeap {
     }
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr, size_t pool_idx) {
+        GC_ASSERT(ptr->pool_idx_ == pool_idx, "Invalid pool index");
+
         stats_.n_collected.fetch_add(1, std::memory_order_relaxed);
         auto &pool = pool_.get();
         // stats_.time_waiting_for_pool += pool_.with_timed([&](auto &pool, auto *lock) {
@@ -866,7 +870,9 @@ class GcHeap {
         };
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
             heap->prepare_allocation(bytes + sizeof(Metadata));
-
+            // if (pool_idx != 0) {
+            //     std::printf("allocating from pool %lld\n", pool_idx);
+            // }
             auto [ptr, t] = heap->pool_.with_timed([&](auto &pool, auto *lock) -> void * {
                 pool.allocation_size_ += bytes + sizeof(Metadata);
                 // auto ptr = reinterpret_cast<uint8_t *>(pool.concurrent_resources.at(pool_idx)->allocate(bytes + sizeof(Metadata), alignment));
@@ -877,6 +883,8 @@ class GcHeap {
                     std::printf("Allocating %p, %lld bytes via pmr, %lld/%lldB used\n", ptr, bytes, pool.allocation_size_.load(), heap->max_heap_size_);
                 }
                 Metadata meta{pool_idx};
+                // if (meta.pool_idx != 0)
+                //     std::printf("alloc from pool %lld\n", meta.pool_idx);
                 std::memcpy(ptr + bytes, &meta, sizeof(Metadata));
                 return ptr;
             },
@@ -932,6 +940,7 @@ public:
         return stats_;
     }
     std::pmr::memory_resource *memory_resource(size_t pool_idx) {
+        GC_ASSERT(gc_memory_resource_[pool_idx].pool_idx == pool_idx, "Invalid pool index");
         return &gc_memory_resource_[pool_idx];
     }
     auto &root_set() {
@@ -949,7 +958,7 @@ public:
     static void destroy();
     template<class T, class... Args>
         requires std::constructible_from<T, Args...>
-    auto *_new_object(Args &&...args) {
+    auto *_new_object(std::optional<size_t> preferred_pool_idx, Args &&...args) {
         if constexpr (is_debug) {
             std::printf("Want to allocate %lld bytes\n", sizeof(T));
             std::fflush(stdout);
@@ -971,7 +980,11 @@ public:
                     lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
                 });
             }
-            pool_idx = object_lists_.get().least_full_list();
+            if (preferred_pool_idx.has_value()) {
+                pool_idx = preferred_pool_idx.value();
+            } else {
+                pool_idx = object_lists_.get().least_full_list();
+            }
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
             return pool.concurrent_resources.at(pool_idx)->with([&](auto &resource, auto *lock) {
                 auto alloc = std::pmr::polymorphic_allocator<T>(resource.get());
@@ -987,6 +1000,8 @@ public:
                                          mode() == GcMode::CONCURRENT);
         stats_.n_allocated.fetch_add(1, std::memory_order_relaxed);
         stats_.time_waiting_for_pool += t;
+        auto offset_of_pool_idx = offsetof(T, pool_idx_);
+        std::memcpy(reinterpret_cast<uint8_t *>(ptr) + offset_of_pool_idx, &pool_idx, sizeof(pool_idx));
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
         GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
         ptr->set_alive(true);
@@ -1244,7 +1259,14 @@ public:
         requires std::constructible_from<T, Args...>
     static Local make(Args &&...args) {
         auto &heap = get_heap();
-        auto gc_ptr = GcPtr<T>{heap._new_object<T>(std::forward<Args>(args)...)};
+        auto gc_ptr = GcPtr<T>{heap._new_object<T>(std::nullopt, std::forward<Args>(args)...)};
+        return Local(gc_ptr);
+    }
+    template<class... Args>
+        requires std::constructible_from<T, Args...>
+    static Local make_in_pool(size_t pool_idx, Args &&...args) {
+        auto &heap = get_heap();
+        auto gc_ptr = GcPtr<T>{heap._new_object<T>(pool_idx, std::forward<Args>(args)...)};
         return Local(gc_ptr);
     }
     // A local handle to a gc object
@@ -1444,7 +1466,7 @@ class GcVector : public Traceable {
     size_t size_;
 
     Local<GcArray<T>> alloc(size_t len) {
-        return Local<GcArray<T>>::make(len);
+        return Local<GcArray<T>>::make_in_pool(pool_idx(), len);
     }
     void ensure_size(size_t new_size) {
         if (data_ == nullptr) {

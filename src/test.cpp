@@ -458,16 +458,5 @@ int main() {
     bench_short_lived_frequent_update();
     bench_random_graph_large();
     test_concurrent_gc_multithread();
-    // test_hashmap();
-    // gc::ThreadPool pool(4);
-    // for (int i = 0; i < 20; i++) {
-    //     std::atomic<int> counter = 0;
-    //     pool.dispatch([&](size_t idx) {
-    //         std::printf("hello from thread %lld\n", idx);
-    //         std::fflush(stdout);
-    //         counter++;
-    //     });
-    //     std::printf("dispatched %d, counter = %d\n", i, counter.load());
-    // }
     return 0;
 }
