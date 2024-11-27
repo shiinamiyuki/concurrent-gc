@@ -63,14 +63,15 @@ void GcHeap::do_concurrent(size_t inc_size) {
             return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected && time_threshold();
         };
         stats_.wait_for_atomic_marking += time_function([&] {
-            while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
-                if constexpr (is_debug) {
-                    std::printf("Waiting for sweeping\n");
-                }
-                lock->unlock();
-                detail::pause_thread();
-                lock->lock();
-            }
+            // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
+            //     if constexpr (is_debug) {
+            //         std::printf("Waiting for sweeping\n");
+            //     }
+            //     lock->unlock();
+            //     detail::pause_thread();
+            //     lock->lock();
+            // }
+            lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
         });
         // in concurrent mode, the mutator might allocate too fast such that a single sweep is not enough
         // this is partly due to newly allocated objects are only collected in the next sweep
@@ -86,29 +87,35 @@ void GcHeap::do_concurrent(size_t inc_size) {
                     GC_ASSERT(pool.concurrent_state != ConcurrentState::IDLE, "State should not be idle");
                     if (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
                         stats_.wait_for_atomic_marking += time_function([&] {
-                        while (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
-                            if constexpr (is_debug) {
-                                std::printf("Memory not enough, waiting for collection\n");
-                            }
-                            lock->unlock();
-                            detail::pause_thread();
-                            lock->lock();
-                        } });
+                            // while (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
+                            //     if constexpr (is_debug) {
+                            //         std::printf("Memory not enough, waiting for collection\n");
+                            //     }
+                            //     lock->unlock();
+                            //     detail::pause_thread();
+                            //     lock->lock();
+                            // }
+                            lock->wait([this, &pool] {
+                                return pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING;
+                            });
+                        });
                     }
                     stats_.wait_for_atomic_marking += time_function([&] {
-                        while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
-                            if constexpr (is_debug) {
-                                std::printf("Waiting for sweeping\n");
-                            }
-                            lock->unlock();
-                            detail::pause_thread();
-                            lock->lock();
-                        }
-                        while (pool.concurrent_state != ConcurrentState::IDLE) {
-                            lock->unlock();
-                            detail::pause_thread();
-                            lock->lock();
-                        }
+                        // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
+                        //     if constexpr (is_debug) {
+                        //         std::printf("Waiting for sweeping\n");
+                        //     }
+                        //     lock->unlock();
+                        //     detail::pause_thread();
+                        //     lock->lock();
+                        // }
+                        lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+                        // while (pool.concurrent_state != ConcurrentState::IDLE) {
+                        //     lock->unlock();
+                        //     detail::pause_thread();
+                        //     lock->lock();
+                        // }
+                        lock->wait([this, &pool] { return pool.concurrent_state != ConcurrentState::IDLE; });
                     });
                 }
                 if (is_mem_available()) {
@@ -117,16 +124,20 @@ void GcHeap::do_concurrent(size_t inc_size) {
             }
         }
         GC_ASSERT(is_mem_available(), "Out of memory");
-    }, false, true);
+    },
+               false, true);
 }
 void GcHeap::concurrent_collector() {
     while (!stop_collector_.load(std::memory_order_relaxed)) {
         pool_.with([&](Pool &pool, auto *lock) {
-            while (pool.concurrent_state == ConcurrentState::IDLE && !stop_collector_.load(std::memory_order_relaxed)) {
-                lock->unlock();
-                detail::pause_thread();
-                lock->lock();
-            }
+            // while (pool.concurrent_state == ConcurrentState::IDLE && !stop_collector_.load(std::memory_order_relaxed)) {
+            //     lock->unlock();
+            //     detail::pause_thread();
+            //     lock->lock();
+            // }
+            lock->wait([this, &pool] {
+                return pool.concurrent_state == ConcurrentState::IDLE && !stop_collector_.load(std::memory_order_relaxed);
+            });
             if (stop_collector_.load(std::memory_order_relaxed)) {
                 return;
             }

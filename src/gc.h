@@ -77,17 +77,19 @@ struct spin_lock {
     void unlock() {
         lock_.store(false, std::memory_order_release);
     }
-    // template<class F>
-    // void wait(F &&f) {
-    //     auto i = 1;
-    //     while (f()) {
-    //         for (auto j = 0; j < i; j++) {
-    //             detail::pause_thread();
-    //         }
-    //         if (i < 8192)
-    //             i *= 2;
-    //     }
-    // }
+    template<class F>
+    void wait(F &&f) {
+        auto i = 1;
+        while (f()) {
+            unlock();
+            for (auto j = 0; j < i; j++) {
+                detail::pause_thread();
+            }
+            lock();
+            if (i < 8192)
+                i *= 2;
+        }
+    }
     bool try_lock() {
         return !lock_.exchange(true, std::memory_order_acquire);
     }
@@ -119,6 +121,19 @@ public:
         if (count == 0) {
             owner = {};
             mutex.unlock();
+        }
+    }
+    template<class F>
+    void wait(F &&f) {
+        auto i = 1;
+        while (f()) {
+            unlock();
+            for (auto j = 0; j < i; j++) {
+                detail::pause_thread();
+            }
+            lock();
+            if (i < 8192)
+                i *= 2;
         }
     }
 };
@@ -906,14 +921,15 @@ public:
             if (mode() == GcMode::CONCURRENT) {
                 // GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
                 stats_.wait_for_atomic_marking += time_function([&] {
-                    while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
-                        if constexpr (is_debug) {
-                            std::printf("Waiting for sweeping\n");
-                        }
-                        lock->unlock();
-                        detail::pause_thread();
-                        lock->lock();
-                    }
+                    // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
+                    //     if constexpr (is_debug) {
+                    //         std::printf("Waiting for sweeping\n");
+                    //     }
+                    //     lock->unlock();
+                    //     detail::pause_thread();
+                    //     lock->lock();
+                    // }
+                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
                 });
             }
             pool_idx = object_lists_.get().least_full_list();
@@ -939,11 +955,12 @@ public:
         stats_.time_waiting_for_pool += pool_.with_timed([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
                 stats_.wait_for_atomic_marking += time_function([&]() {
-                    while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
-                        lock->unlock();
-                        detail::pause_thread();
-                        lock->lock();
-                    }
+                    // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
+                    //     lock->unlock();
+                    //     detail::pause_thread();
+                    //     lock->lock();
+                    // }
+                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
                 });
             }
             if (mode() != GcMode::STOP_THE_WORLD) {

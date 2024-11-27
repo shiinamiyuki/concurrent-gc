@@ -349,7 +349,7 @@ int main() {
     auto bench = []<class C>(C policy) {
         policy.init();
         StatsTracker tracker;
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 3; i++) {
             // download from https://github.com/json-iterator/test-data/blob/master/large-file.json
             std::ifstream ifs("large-file.json");
             if (!ifs) {
