@@ -392,14 +392,14 @@ int main() {
             auto json = parse_json(policy, json_s);
             auto elapsed = (std::chrono::high_resolution_clock::now() - t).count() * 1e-9;
             tracker.update(elapsed);
-            std::cout << Formatter<C>::format(*json) << std::endl;
+            // std::cout << Formatter<C>::format(*json) << std::endl;
         }
         tracker.print(policy.name().c_str());
         policy.finalize();
     };
 
-    // bench(RcPolicy<rc::RefCounter>{});
-    // bench(RcPolicy<rc::AtomicRefCounter>{});
+    bench(RcPolicy<rc::RefCounter>{});
+    bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
     option.max_heap_size = 1024 * 1024 * 256;
     option.mode = gc::GcMode::INCREMENTAL;
