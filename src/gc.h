@@ -13,6 +13,8 @@
 #include <mutex>
 #include <list>
 #include <barrier>
+#include <condition_variable>
+#include <cstring>
 
 static_assert(sizeof(size_t) == 8, "64-bit only");
 #define GC_ASSERT(x, msg)                                    \
@@ -969,7 +971,7 @@ public:
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
             return pool.concurrent_resources.at(pool_idx)->with([&](auto &resource, auto *lock) {
                 auto alloc = std::pmr::polymorphic_allocator<T>(resource.get());
-                auto ptr = alloc.allocate_object<T>(1);
+                auto ptr = alloc.template allocate_object<T>(1);
                 if constexpr (is_debug) {
                     std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_.load(), max_heap_size_);
                     std::fflush(stdout);

@@ -349,9 +349,10 @@ int main() {
     auto bench = []<class C>(C policy) {
         policy.init();
         StatsTracker tracker;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 1; i++) {
             // download from https://github.com/json-iterator/test-data/blob/master/large-file.json
-            std::ifstream ifs("large-file.json");
+            // std::ifstream ifs("json-test.json");
+         std::ifstream ifs("large-file.json");
             if (!ifs) {
                 std::cerr << "Failed to open file large-file.json, please download from https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json" << std::endl;
                 std::exit(1);
@@ -361,14 +362,14 @@ int main() {
             auto json = parse_json(policy, json_s);
             auto elapsed = (std::chrono::high_resolution_clock::now() - t).count() * 1e-9;
             tracker.update(elapsed);
-            // std::cout << Formatter<C>::format(*json) << std::endl;
+            std::cout << Formatter<C>::format(*json) << std::endl;
         }
         tracker.print(policy.name().c_str());
         policy.finalize();
     };
 
-    bench(RcPolicy<rc::RefCounter>{});
-    bench(RcPolicy<rc::AtomicRefCounter>{});
+    // bench(RcPolicy<rc::RefCounter>{});
+    // bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
     option.max_heap_size = 1024 * 1024 * 256;
     option.mode = gc::GcMode::INCREMENTAL;
