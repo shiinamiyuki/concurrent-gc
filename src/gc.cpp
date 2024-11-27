@@ -350,7 +350,7 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
         }
         cnt++;
     }
-    std::printf("sweeped %d objects, %d collected from pool %lld\n", cnt, collect_cnt, pool_idx);
+    // std::printf("sweeped %d objects, %d collected from pool %lld\n", cnt, collect_cnt, pool_idx);
     return {collect_cnt, cnt, head, prev};
 }
 void GcHeap::sweep() {
@@ -403,9 +403,9 @@ void GcHeap::sweep() {
             });
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            // if constexpr (is_debug) {
-            std::printf("Sweeping list %lld took %f s\n", i, t * 1e-9);
-            // }
+            if constexpr (is_debug) {
+                std::printf("Sweeping list %lld took %f s\n", i, t * 1e-9);
+            }
         };
         if (is_paralle_collection()) {
             auto &workers = worker_pool_.value();
@@ -413,15 +413,19 @@ void GcHeap::sweep() {
             workers.dispatch(do_sweep);
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            std::printf("Parallel sweeping took %f s\n", t * 1e-9);
+            if constexpr (is_debug) {
+                std::printf("Parallel sweeping took %f s\n", t * 1e-9);
+            }
         } else {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < object_lists.size(); i++) {
-            do_sweep(i);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        auto t = (t1 - t0).count();
-        std::printf("sweeping took %f s\n", t * 1e-9);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < object_lists.size(); i++) {
+                do_sweep(i);
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto t = (t1 - t0).count();
+            if constexpr (is_debug) {
+                std::printf("sweeping took %f s\n", t * 1e-9);
+            }
         }
 
         if (mode_ != GcMode::CONCURRENT) {

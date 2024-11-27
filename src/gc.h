@@ -763,7 +763,7 @@ class GcHeap {
         if constexpr (is_debug) {
             std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), pool.allocation_size_.load(), max_heap_size_);
         }
-        pool.allocation_size_ -= ptr->object_size();
+        pool.allocation_size_.fetch_sub(ptr->object_size(), std::memory_order_relaxed);
         ptr->set_alive(false);
         auto size = ptr->object_size();
         auto align = ptr->object_alignment();
@@ -883,7 +883,7 @@ class GcHeap {
                            std::size_t alignment) override {
             // heap->stats_.time_waiting_for_pool += heap->pool_.with_timed([&](auto &pool, auto *lock) {
             auto &pool = heap->pool_.get();
-            pool.allocation_size_ -= bytes + sizeof(Metadata);
+            pool.allocation_size_.fetch_sub(bytes + sizeof(Metadata), std::memory_order_relaxed);
             if constexpr (is_debug) {
                 std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, pool.allocation_size_.load(), heap->max_heap_size_);
             }

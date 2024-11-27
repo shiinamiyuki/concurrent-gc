@@ -339,9 +339,9 @@ void bench_random_graph_large() {
         }
         gc::GcHeap::destroy();
     };
-    // bench(gc::GcMode::STOP_THE_WORLD, false);
-    // bench(gc::GcMode::INCREMENTAL, false);
-    // bench(gc::GcMode::CONCURRENT, false);
+    bench(gc::GcMode::STOP_THE_WORLD, false);
+    bench(gc::GcMode::INCREMENTAL, false);
+    bench(gc::GcMode::CONCURRENT, false);
     bench(gc::GcMode::STOP_THE_WORLD, true);
     bench(gc::GcMode::CONCURRENT, true);
 }
@@ -454,10 +454,10 @@ void test_hashmap() {
     gc::GcHeap::destroy();
 }
 int main() {
-    // bench_short_lived_few_update();
-    // bench_short_lived_frequent_update();
+    bench_short_lived_few_update();
+    bench_short_lived_frequent_update();
     bench_random_graph_large();
-    // test_concurrent_gc_multithread();
+    test_concurrent_gc_multithread();
     // test_hashmap();
     // gc::ThreadPool pool(4);
     // for (int i = 0; i < 20; i++) {
