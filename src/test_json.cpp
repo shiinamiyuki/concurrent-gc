@@ -371,9 +371,17 @@ int main() {
     bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
     option.max_heap_size = 1024 * 1024 * 256;
+    // option.mode = gc::GcMode::INCREMENTAL;
+    // bench(GcPolicy{option});
+
+    // option.n_collector_threads = 1;
+    // option.mode = gc::GcMode::STOP_THE_WORLD;
+    // bench(GcPolicy{option});
+
+    // option.mode = gc::GcMode::CONCURRENT;
+    // bench(GcPolicy{option});
+    option.n_collector_threads = 4;
     option.mode = gc::GcMode::STOP_THE_WORLD;
-    bench(GcPolicy{option});
-    option.mode = gc::GcMode::INCREMENTAL;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
     bench(GcPolicy{option});

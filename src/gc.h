@@ -12,6 +12,7 @@
 #include <emmintrin.h>
 #include <mutex>
 #include <list>
+#include <barrier>
 
 static_assert(sizeof(size_t) == 8, "64-bit only");
 #define GC_ASSERT(x, msg)                                    \
@@ -246,7 +247,8 @@ class GcHeap;
 class GcObjectContainer;
 struct TracingContext {
     GcHeap &heap;
-    explicit TracingContext(GcHeap &heap) : heap(heap) {}
+    size_t pool_idx;
+    explicit TracingContext(GcHeap &heap, size_t pool_idx) : heap(heap), pool_idx(pool_idx) {}
     void shade(const GcObjectContainer *ptr) const noexcept;
 };
 template<class T>
@@ -296,7 +298,7 @@ class GcObjectContainer {
     friend class GcPtr;
 protected:
     friend class GcHeap;
-    mutable uint8_t color_ = color::WHITE;
+    mutable std::atomic<uint8_t> color_ = color::WHITE;
     mutable bool alive = true;
     mutable uint16_t root_ref_count = 0;
     /// @brief if we were using rust, the below field might only take 8 bytes...
@@ -307,7 +309,7 @@ protected:
         alive = value;
     }
     void set_color(uint8_t value) const {
-        color_ = value;
+        color_.store(value, std::memory_order_relaxed);
     }
     void inc_root_ref_count() const {
         root_ref_count++;
@@ -383,23 +385,34 @@ struct WorkList {
     using list_t = detail::LockProtected<detail::spin_lock, std::deque<const GcObjectContainer *>>;
     std::vector<std::unique_ptr<list_t>> lists;
     void append(const GcObjectContainer *ptr) {
-        if (lists.size() > 1) {
-            auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lists.size();
-            lists[tid]->with([&](auto &list, auto *lock) {
-                list.push_back(ptr);
-            });
-        } else {
-            lists[0]->get().push_back(ptr);
+        // if (lists.size() > 1) {
+        //     auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lists.size();
+        //     lists[tid]->with([&](auto &list, auto *lock) {
+        //         list.push_back(ptr);
+        //     });
+        // } else {
+        //     lists[0]->get().push_back(ptr);
+        // }
+        GC_ASSERT(lists.size() == 1, "Only one work list is supported");
+        lists[0]->get().push_back(ptr);
+    }
+    size_t least_filled() const {
+        size_t min = std::numeric_limits<size_t>::max();
+        size_t idx = 0;
+        for (size_t i = 0; i < lists.size(); i++) {
+            auto &list = lists[i]->get();
+            if (list.size() < min) {
+                min = list.size();
+                idx = i;
+            }
         }
+        return idx;
     }
     const GcObjectContainer *pop() {
         list_t *list = nullptr;
-        if (lists.size() > 1) {
-            auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lists.size();
-            list = lists[tid].get();
-        } else {
-            list = lists[0].get();
-        }
+        GC_ASSERT(lists.size() == 1, "Only one work list is supported");
+        list = lists[0].get();
+
         return list->with([&](auto &list, auto *lock) {
             GC_ASSERT(!list.empty(), "Work list should not be empty");
             auto ptr = list.front();
@@ -407,23 +420,20 @@ struct WorkList {
             return ptr;
         });
     }
-    std::vector<const GcObjectContainer *> pop_n(size_t n) {
-        std::vector<const GcObjectContainer *> result;
-        list_t *list = nullptr;
-        if (lists.size() > 1) {
-            auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lists.size();
-            list = lists[tid].get();
-        } else {
-            list = lists[0].get();
-        }
-        return list->with([&](auto &list, auto *lock) {
-            for (size_t i = 0; i < n; i++) {
-                result.push_back(list.front());
-                list.pop_front();
-            }
-            return result;
-        });
-    }
+    // std::vector<const GcObjectContainer *> pop_n(size_t n) {
+    //     std::vector<const GcObjectContainer *> result;
+    //     list_t *list = nullptr;
+    //     GC_ASSERT(lists.size() == 1, "Only one work list is supported");
+    //     list = lists[0].get();
+
+    //     return list->with([&](auto &list, auto *lock) {
+    //         for (size_t i = 0; i < n; i++) {
+    //             result.push_back(list.front());
+    //             list.pop_front();
+    //         }
+    //         return result;
+    //     });
+    // }
     bool empty() const {
         bool empty = true;
         for (auto &list : lists) {
@@ -558,26 +568,43 @@ auto time_function(F &&f) {
 struct ThreadPool {
     std::vector<std::thread> threads;
     std::mutex mutex;
-    std::condition_variable has_work;
+    std::condition_variable has_work, has_result;
     std::atomic<bool> stop = false;
-    std::deque<std::function<void(size_t)>> work;
+    std::optional<std::function<void(size_t)>> work{};
+    std::barrier<> barrier;
 public:
-    ThreadPool(size_t n_threads = 4) {
+    ThreadPool(size_t n_threads = 4) : barrier(n_threads) {
         for (size_t i = 0; i < n_threads; i++) {
-            threads.emplace_back([this, i] {
+            threads.emplace_back([=, this] {
                 while (!stop) {
                     std::unique_lock<std::mutex> lock(mutex);
-                    has_work.wait(lock, [this] { return stop || !work.empty(); });
-                    if (stop) {
+                    has_work.wait(lock, [this] { return stop || work.has_value(); });
+                    if (stop || !work.has_value()) {
                         return;
                     }
-                    auto f = std::move(work.front());
-                    work.pop_front();
+                    auto &f = work.value();
                     lock.unlock();
                     f(i);
+                    // std::printf("thread %lld done\n", i);
+                    barrier.arrive_and_wait();
+                    if (i == 0) {
+                        // std::printf("thread %lld notifying\n", i);
+                        work.reset();
+                        has_result.notify_all();
+                    }
+                    barrier.arrive_and_wait();
                 }
             });
         }
+    }
+    template<class F>
+        requires std::invocable<F, size_t>
+    void dispatch(F &&f) {
+        std::unique_lock<std::mutex> lock(mutex);
+        work.emplace(std::forward<F>(f));
+        has_work.notify_all();
+        has_result.wait(lock);
+        GC_ASSERT(!work.has_value(), "Work should be done");
     }
     ~ThreadPool() {
         stop = true;
@@ -635,7 +662,7 @@ class GcHeap {
     };
     std::optional<ThreadPool> worker_pool_;
     struct Pool {
-        size_t allocation_size_ = 0;
+        std::atomic<size_t> allocation_size_ = 0;
         // std::unique_ptr<std::pmr::memory_resource> inner;
         using resouce_t = detail::LockProtected<detail::spin_lock, std::unique_ptr<std::pmr::memory_resource>>;
         std::vector<std::unique_ptr<resouce_t>> concurrent_resources;
@@ -664,6 +691,8 @@ class GcHeap {
         std::atomic<size_t> count = 0;
         ObjectList() = default;
         ObjectList(const ObjectList &list) : head(list.head), count(list.count.load()) {}
+        ObjectList(ObjectList &&list) : head(list.head), count(list.count.load()) {
+        }
         void insert(GcObjectContainer *ptr) {
             ptr->next_ = head;
             head = ptr;
@@ -729,39 +758,42 @@ class GcHeap {
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr, size_t pool_idx) {
         stats_.n_collected.fetch_add(1, std::memory_order_relaxed);
-        stats_.time_waiting_for_pool += pool_.with_timed([&](auto &pool, auto *lock) {
-            if constexpr (is_debug) {
-                std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), pool.allocation_size_, max_heap_size_);
-            }
-            pool.allocation_size_ -= ptr->object_size();
-            ptr->set_alive(false);
-            auto size = ptr->object_size();
-            auto align = ptr->object_alignment();
-            ptr->~GcObjectContainer();
-            pool.concurrent_resources[pool_idx]->with([&](auto &resource, auto *lock) {
-                resource->deallocate(ptr, size, align);
-            });
+        auto &pool = pool_.get();
+        // stats_.time_waiting_for_pool += pool_.with_timed([&](auto &pool, auto *lock) {
+        if constexpr (is_debug) {
+            std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), pool.allocation_size_.load(), max_heap_size_);
+        }
+        pool.allocation_size_ -= ptr->object_size();
+        ptr->set_alive(false);
+        auto size = ptr->object_size();
+        auto align = ptr->object_alignment();
+        ptr->~GcObjectContainer();
+        pool.concurrent_resources.at(pool_idx)->with([&](auto &resource, auto *lock) {
+            resource->deallocate(ptr, size, align);
         });
+        // });
     }
     /// @brief `shade` it self do not acquire the lock on work_list
     /// @param ptr
-    void shade(const GcObjectContainer *ptr);
+    void shade(const GcObjectContainer *ptr, size_t pool_idx);
     /// @brief scan a gray object and possibly add its children to the work list
     /// scan doees not acquire the lock on work_list
     /// @param ptr
-    void scan(const GcObjectContainer *ptr) {
+    void scan(const GcObjectContainer *ptr, size_t pool_idx) {
         if (!ptr) {
             return;
         }
         if constexpr (is_debug) {
-            std::printf("scanning %p\n", static_cast<const void *>(ptr));
+            std::printf("scanning %p from pool %lld\n", static_cast<const void *>(ptr), pool_idx);
             std::fflush(stdout);
         }
         if (mode() != GcMode::CONCURRENT) {
             GC_ASSERT(ptr->color() == color::GRAY || ptr->is_root(), "Object should be gray");
         }
-
-        auto ctx = TracingContext{*this};
+        if (ptr->color() == color::BLACK) {
+            return;
+        }
+        auto ctx = TracingContext{*this, pool_idx};
         if (auto traceable = ptr->as_tracable()) {
             traceable->trace(Tracer{ctx});
         }
@@ -804,7 +836,7 @@ class GcHeap {
         GC_ASSERT(work_list.get().empty(), "Work list should be empty");
         bool threshold_condition = pool_.get().allocation_size_ + inc_size > max_heap_size_ * gc_threshold_;
         if constexpr (is_debug) {
-            std::printf("allocation_size_ = %llu, max_heap_size_ = %llu, inc_size = %llu\n", pool_.get().allocation_size_, max_heap_size_, inc_size);
+            std::printf("allocation_size_ = %llu, max_heap_size_ = %llu, inc_size = %llu\n", pool_.get().allocation_size_.load(), max_heap_size_, inc_size);
             std::printf("threshold_condition = %d\n", threshold_condition);
         }
         if (pool_.get().allocation_size_ + inc_size > max_heap_size_) {
@@ -826,17 +858,17 @@ class GcHeap {
             size_t pool_idx;
         };
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
-            heap->prepare_allocation(bytes);
+            heap->prepare_allocation(bytes + sizeof(Metadata));
 
             auto pool_idx = std::hash<std::thread::id>{}(std::this_thread::get_id()) % heap->object_lists_.get().lists.size();
             auto [ptr, t] = heap->pool_.with_timed([&](auto &pool, auto *lock) -> void * {
                 pool.allocation_size_ += bytes + sizeof(Metadata);
-                // auto ptr = reinterpret_cast<uint8_t *>(pool.concurrent_resources[pool_idx]->allocate(bytes + sizeof(Metadata), alignment));
-                auto ptr = pool.concurrent_resources[pool_idx]->with([&](auto &resource, auto *lock) {
+                // auto ptr = reinterpret_cast<uint8_t *>(pool.concurrent_resources.at(pool_idx)->allocate(bytes + sizeof(Metadata), alignment));
+                auto ptr = pool.concurrent_resources.at(pool_idx)->with([&](auto &resource, auto *lock) {
                     return reinterpret_cast<uint8_t *>(resource->allocate(bytes + sizeof(Metadata), alignment));
                 });
                 if constexpr (is_debug) {
-                    std::printf("Allocating %p, %lld bytes via pmr, %lld/%lldB used\n", ptr, bytes, pool.allocation_size_, heap->max_heap_size_);
+                    std::printf("Allocating %p, %lld bytes via pmr, %lld/%lldB used\n", ptr, bytes, pool.allocation_size_.load(), heap->max_heap_size_);
                 }
                 Metadata meta{pool_idx};
                 std::memcpy(ptr + bytes, &meta, sizeof(Metadata));
@@ -849,18 +881,19 @@ class GcHeap {
         void do_deallocate(void *p,
                            std::size_t bytes,
                            std::size_t alignment) override {
-            heap->stats_.time_waiting_for_pool += heap->pool_.with_timed([&](auto &pool, auto *lock) {
-                pool.allocation_size_ -= bytes + sizeof(Metadata);
-                if constexpr (is_debug) {
-                    std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, pool.allocation_size_, heap->max_heap_size_);
-                }
-                Metadata meta{};
-                std::memcpy(&meta, static_cast<uint8_t *>(p) + bytes, sizeof(Metadata));
-                // pool.concurrent_resources[meta.pool_idx]->deallocate(p, bytes + sizeof(Metadata), alignment);
-                pool.concurrent_resources[meta.pool_idx]->with([&](auto &resource, auto *lock) {
-                    resource->deallocate(p, bytes + sizeof(Metadata), alignment);
-                });
+            // heap->stats_.time_waiting_for_pool += heap->pool_.with_timed([&](auto &pool, auto *lock) {
+            auto &pool = heap->pool_.get();
+            pool.allocation_size_ -= bytes + sizeof(Metadata);
+            if constexpr (is_debug) {
+                std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, pool.allocation_size_.load(), heap->max_heap_size_);
+            }
+            Metadata meta{};
+            std::memcpy(&meta, static_cast<uint8_t *>(p) + bytes, sizeof(Metadata));
+            // pool.concurrent_resources[meta.pool_idx]->deallocate(p, bytes + sizeof(Metadata), alignment);
+            pool.concurrent_resources[meta.pool_idx]->with([&](auto &resource, auto *lock) {
+                resource->deallocate(p, bytes + sizeof(Metadata), alignment);
             });
+            // });
         }
         bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
             return this == &other;
@@ -934,11 +967,11 @@ public:
             }
             pool_idx = object_lists_.get().least_full_list();
             GC_ASSERT(pool.allocation_size_ + sizeof(T) <= max_heap_size_, "Out of memory");
-            return pool.concurrent_resources[pool_idx]->with([&](auto &resource, auto *lock) {
+            return pool.concurrent_resources.at(pool_idx)->with([&](auto &resource, auto *lock) {
                 auto alloc = std::pmr::polymorphic_allocator<T>(resource.get());
                 auto ptr = alloc.allocate_object<T>(1);
                 if constexpr (is_debug) {
-                    std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_, max_heap_size_);
+                    std::printf("Allocated object %p, %lld/%lldB used\n", static_cast<void *>(ptr), pool.allocation_size_.load(), max_heap_size_);
                     std::fflush(stdout);
                 }
                 pool.allocation_size_ += sizeof(T);
@@ -967,7 +1000,7 @@ public:
                 // this is necessary, you can't just color it black since the above line `T(std::forward<Args>(args)...);`
                 // invokes the constructor and might setup some member pointers
                 stats_.time_waiting_for_work_list += work_list.with_timed([&](auto &work_list, auto *lock) {
-                    shade(ptr);
+                    shade(ptr, pool_idx);
                 });
             }
             // possible sync issue here
@@ -980,7 +1013,7 @@ public:
                 //     ptr->next_ = list.head;
                 //     list.head = ptr;
                 // }
-                lists.lists[pool_idx]->with([&](auto &list, auto *lock) {
+                lists.lists.at(pool_idx)->with([&](auto &list, auto *lock) {
                     list.insert(ptr);
                 });
             });
@@ -992,11 +1025,20 @@ public:
     std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> sweep_list(ObjectList &list, size_t pool_idx);
     void scan_roots();
     bool mark_some(size_t max_count);
-    void add_to_working_list(const GcObjectContainer *ptr) {
+    void parallel_marking();
+    // void add_to_working_list(const GcObjectContainer *ptr) {
+    //     if constexpr (is_debug) {
+    //         std::printf("adding %p to work list\n", static_cast<const void *>(ptr));
+    //     }
+    //     work_list.get().append(ptr);
+    // }
+    void add_to_working_list(const GcObjectContainer *ptr, size_t pool_idx) {
         if constexpr (is_debug) {
-            std::printf("adding %p to work list\n", static_cast<const void *>(ptr));
+            std::printf("adding %p to work list %lld\n", static_cast<const void *>(ptr), pool_idx);
         }
-        work_list.get().append(ptr);
+        work_list.get().lists.at(pool_idx)->with([&](auto &list, auto *lock) {
+            list.push_back(ptr);
+        });
     }
     ~GcHeap() {
         if (stop_collector_) {
@@ -1154,7 +1196,7 @@ class Local {
                 });
                 if (ptr_.gc_object_container()->color() == color::WHITE) {
                     heap.stats_.time_waiting_for_work_list += heap.work_list.with_timed([&](auto &work_list, auto *lock) {
-                        heap.shade(ptr_.gc_object_container());
+                        heap.shade(ptr_.gc_object_container(), work_list.least_filled());
                     });
                 }
             }
@@ -1280,7 +1322,9 @@ class Member {
                 if constexpr (is_debug) {
                     std::printf("write barrier, color=%d\n", ptr->color());
                 }
-                heap.stats_.wait_for_atomic_marking += heap.work_list.with_timed([&](auto &work_list, auto *lock) { heap.shade(ptr.gc_object_container()); });
+                heap.stats_.wait_for_atomic_marking += heap.work_list.with_timed([&](auto &work_list, auto *lock) {
+                    heap.shade(ptr.gc_object_container(), work_list.least_filled());
+                });
             }
         }
     }

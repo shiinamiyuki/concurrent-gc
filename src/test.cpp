@@ -154,8 +154,10 @@ void bench_short_lived_few_update() {
                     // std::printf("i=%d,node->val=%d\n", i, root->children->at(i)->val);
                     //   std::printf("%lld %p\n",root->children->at(i).control_block_->ref_count, static_cast<void *>(root->children->at(i).control_block_));
                 }
-                GC_ASSERT(sum == n * (n - 1) / 2, "invalid sum");
+                // gc::get_heap().collect();
                 // std::printf("sum = %d\n", sum);
+                GC_ASSERT(sum == n * (n - 1) / 2, "invalid sum");
+
                 // std::printf("%lld %p\n", root.control_block_->ref_count, static_cast<void *>(root.control_block_));
 
                 auto elapsed = std::chrono::high_resolution_clock::now() - time;
@@ -181,6 +183,11 @@ void bench_short_lived_few_update() {
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::INCREMENTAL;
+    bench(GcPolicy{option});
+    option.mode = gc::GcMode::CONCURRENT;
+    bench(GcPolicy{option});
+    option.n_collector_threads = 4;
+    option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
     bench(GcPolicy{option});
@@ -254,16 +261,24 @@ void bench_short_lived_frequent_update() {
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
     bench(GcPolicy{option});
+    option.n_collector_threads = 4;
+    option.mode = gc::GcMode::STOP_THE_WORLD;
+    bench(GcPolicy{option});
+    option.mode = gc::GcMode::CONCURRENT;
+    bench(GcPolicy{option});
 }
 
 void bench_random_graph_large() {
     printf("Running random graph benchmark (Large)\n");
     gc::enable_time_tracking = false;
-    auto bench = [](gc::GcMode mode) {
-        printf("benchmarking %s\n", gc::to_string(mode));
+    auto bench = [](gc::GcMode mode, bool parallel) {
         gc::GcOption option{};
         option.mode = mode;
         option.max_heap_size = 1024 * 1024 * 256;
+        if (parallel) {
+            option.n_collector_threads = 8;
+        }
+        printf("benchmarking %s\n", GcPolicy{option}.name().c_str());
         gc::GcHeap::init(option);
         Rng rng(0);
         StatsTracker tracker;
@@ -324,9 +339,11 @@ void bench_random_graph_large() {
         }
         gc::GcHeap::destroy();
     };
-    bench(gc::GcMode::STOP_THE_WORLD);
-    bench(gc::GcMode::INCREMENTAL);
-    bench(gc::GcMode::CONCURRENT);
+    // bench(gc::GcMode::STOP_THE_WORLD, false);
+    // bench(gc::GcMode::INCREMENTAL, false);
+    // bench(gc::GcMode::CONCURRENT, false);
+    bench(gc::GcMode::STOP_THE_WORLD, true);
+    bench(gc::GcMode::CONCURRENT, true);
 }
 // void test_random() {
 //     gc::GcOption option{};
@@ -439,8 +456,18 @@ void test_hashmap() {
 int main() {
     // bench_short_lived_few_update();
     // bench_short_lived_frequent_update();
-    // bench_random_graph_large();
-    test_concurrent_gc_multithread();
+    bench_random_graph_large();
+    // test_concurrent_gc_multithread();
     // test_hashmap();
+    // gc::ThreadPool pool(4);
+    // for (int i = 0; i < 20; i++) {
+    //     std::atomic<int> counter = 0;
+    //     pool.dispatch([&](size_t idx) {
+    //         std::printf("hello from thread %lld\n", idx);
+    //         std::fflush(stdout);
+    //         counter++;
+    //     });
+    //     std::printf("dispatched %d, counter = %d\n", i, counter.load());
+    // }
     return 0;
 }
