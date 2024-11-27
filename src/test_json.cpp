@@ -351,30 +351,7 @@ C::template Owned<JsonValue<C>> parse_json(C policy, const std::string &json) {
     return parser.parse_value();
 }
 using StatsTracker = gc::StatsTracker;
-// int main() {
-//     auto src = R"(
-// {
-//     "key1": "value1",
-//     "key2": 123,
-//     "key3": true,
-//     "key4": null,
-//     "key5": {
-//         "key6": "value6",
-//         "key7": 456,
-//         "key8": false,
-//         "key9": null
-//     },
-//     } )";
-//     gc::GcOption option{};
-//     option.max_heap_size = 1024 * 1024 * 1024;
-//     GcPolicy{}.init();
-//     {
-//         auto json = parse_json(GcPolicy{}, src);
-//         std::cout << Formatter<GcPolicy>::format(*json) << std::endl;
-//     }
-//     GcPolicy{}.finalize();
-//     return 0;
-// }
+
 int main() {
     auto bench = []<class C>(C policy) {
         policy.init();
@@ -382,7 +359,7 @@ int main() {
         for (int i = 0; i < 1; i++) {
             // download from https://github.com/json-iterator/test-data/blob/master/large-file.json
             // std::ifstream ifs("json-test.json");
-         std::ifstream ifs("large-file.json");
+            std::ifstream ifs("large-file.json");
             if (!ifs) {
                 std::cerr << "Failed to open file large-file.json, please download from https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json" << std::endl;
                 std::exit(1);

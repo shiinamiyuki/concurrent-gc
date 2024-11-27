@@ -302,6 +302,7 @@ protected:
     friend class GcHeap;
     mutable std::atomic<uint8_t> color_ = color::WHITE;
     mutable bool alive = true;
+    uint8_t pool_idx_ = 0;
     mutable uint16_t root_ref_count = 0;
     /// @brief if we were using rust, the below field might only take 8 bytes...
     mutable std::optional<RootSet::Node> root_node = {};
@@ -320,6 +321,9 @@ protected:
         root_ref_count--;
     }
 public:
+    size_t pool_idx() const {
+        return pool_idx_;
+    }
     bool is_root() const {
         // return root_ref_count > 0;
         return root_node.has_value();
@@ -855,14 +859,14 @@ class GcHeap {
     }
     struct gc_memory_resource : std::pmr::memory_resource {
         GcHeap *heap;
-        gc_memory_resource(GcHeap *heap) : heap(heap) {}
+        size_t pool_idx;
+        gc_memory_resource(GcHeap *heap, size_t pool_idx) : heap(heap), pool_idx(pool_idx) {}
         struct Metadata {
             size_t pool_idx;
         };
         void *do_allocate(std::size_t bytes, std::size_t alignment) override {
             heap->prepare_allocation(bytes + sizeof(Metadata));
 
-            auto pool_idx = std::hash<std::thread::id>{}(std::this_thread::get_id()) % heap->object_lists_.get().lists.size();
             auto [ptr, t] = heap->pool_.with_timed([&](auto &pool, auto *lock) -> void * {
                 pool.allocation_size_ += bytes + sizeof(Metadata);
                 // auto ptr = reinterpret_cast<uint8_t *>(pool.concurrent_resources.at(pool_idx)->allocate(bytes + sizeof(Metadata), alignment));
@@ -898,10 +902,10 @@ class GcHeap {
             // });
         }
         bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
-            return this == &other;
+            return heap == static_cast<const gc_memory_resource &>(other).heap && pool_idx == static_cast<const gc_memory_resource &>(other).pool_idx;
         }
     };
-    gc_memory_resource gc_memory_resource_;/// making gc aware of non-traceable memory usage
+    std::vector<gc_memory_resource> gc_memory_resource_;/// making gc aware of non-traceable memory usage
     // std::condition_variable work_list_non_empty_;
     // std::condition_variable mem_available_;
     std::atomic_bool stop_collector_ = false;
@@ -927,8 +931,8 @@ public:
     GcStats &stats() {
         return stats_;
     }
-    std::pmr::memory_resource *memory_resource() {
-        return &gc_memory_resource_;
+    std::pmr::memory_resource *memory_resource(size_t pool_idx) {
+        return &gc_memory_resource_[pool_idx];
     }
     auto &root_set() {
         return root_set_;
@@ -986,7 +990,7 @@ public:
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
         GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
         ptr->set_alive(true);
-
+        ptr->pool_idx_ = static_cast<uint8_t>(pool_idx);
         stats_.time_waiting_for_pool += pool_.with_timed([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
                 stats_.wait_for_atomic_marking += time_function([&]() {
@@ -1396,7 +1400,7 @@ class GcArray : public Traceable {
 public:
     GcArray(size_t n) : data_(nullptr), size_(n) {
         auto &heap = get_heap();
-        auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource());
+        auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource(pool_idx()));
         data_ = alloc.template allocate_object<Member<T>>(n);
         for (size_t i = 0; i < n; i++) {
             new (data_ + i) Member<T>(this);
@@ -1427,7 +1431,7 @@ public:
     }
     ~GcArray() {
         auto &heap = get_heap();
-        auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource());
+        auto alloc = std::pmr::polymorphic_allocator(heap.memory_resource(pool_idx()));
         for (size_t i = 0; i < size_; i++) {
             data_[i].~Member<T>();
         }

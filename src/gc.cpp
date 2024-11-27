@@ -35,8 +35,7 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
       pool_(detail::emplace_t{}, option.mode == GcMode::CONCURRENT, option),
       object_lists_(ObjectLists{}, option.mode == GcMode::CONCURRENT),
       root_set_(RootSet{}, option.mode == GcMode::CONCURRENT),
-      work_list(WorkList{}, option.mode == GcMode::CONCURRENT),
-      gc_memory_resource_(this) {
+      work_list(WorkList{}, option.mode == GcMode::CONCURRENT) {
     if (option.n_collector_threads.has_value()) {
         GC_ASSERT(option.mode != GcMode::INCREMENTAL, "Incremental mode does not support multiple threads");
         GC_ASSERT(option.n_collector_threads.value() > 0, "Number of collector threads should be positive");
@@ -46,11 +45,13 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
         for (auto i = 0; i < option.n_collector_threads.value(); i++) {
             lists.emplace_back(std::move(std::make_unique<ObjectLists::list_t>(ObjectList{}, true)));
             work_list.get().lists.emplace_back(std::move(std::make_unique<WorkList::list_t>(std::deque<const GcObjectContainer *>{}, false)));
+            gc_memory_resource_.emplace_back(this, i);
         }
 
     } else {
         object_lists_.get().lists.emplace_back(std::move(std::make_unique<ObjectLists::list_t>(ObjectList{}, false)));
         work_list.get().lists.emplace_back(std::move(std::make_unique<WorkList::list_t>(std::deque<const GcObjectContainer *>{}, false)));
+        gc_memory_resource_.emplace_back(this, 0);
     }
 }
 void GcHeap::signal_collection() {
