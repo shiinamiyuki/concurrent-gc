@@ -12,6 +12,7 @@
 #include <emmintrin.h>
 #include <mutex>
 #include <list>
+#include "heap.h"
 static_assert(sizeof(size_t) == 8, "64-bit only");
 #define GC_ASSERT(x, msg)                                    \
     do {                                                     \
@@ -76,6 +77,20 @@ struct spin_lock {
     void unlock() {
         lock_.store(false, std::memory_order_release);
     }
+    // template<class F>
+    // void wait(F &&f) {
+    //     auto i = 1;
+    //     while (f()) {
+    //         for (auto j = 0; j < i; j++) {
+    //             detail::pause_thread();
+    //         }
+    //         if (i < 8192)
+    //             i *= 2;
+    //     }
+    // }
+    bool try_lock() {
+        return !lock_.exchange(true, std::memory_order_acquire);
+    }
 };
 // #endif
 struct recursive_spinlock {
@@ -126,43 +141,49 @@ struct emplace_t {};
 template<Lockable Lock, class T>
 class LockProtected {
     T data;
-    std::optional<Lock> lock;
+    std::optional<Lock> lock_;
 public:
 
     LockProtected() = delete;
     LockProtected(bool enable) : data() {
         if (enable) {
-            lock.emplace();
+            lock_.emplace();
         }
     }
     LockProtected(T data, bool enable) : data(std::move(data)) {
         if (enable) {
-            lock.emplace();
+            lock_.emplace();
         }
     }
     template<class... Args>
     LockProtected(emplace_t, bool enable, Args &&...args) : data(std::forward<Args>(args)...) {
         if (enable) {
-            lock.emplace();
+            lock_.emplace();
         }
+    }
+    auto &get_lock() {
+        return lock_.value();
+    }
+    bool lock_enabled() const {
+        return lock_.has_value();
     }
     template<class F>
         requires std::invocable<F, T &, Lock *>
     auto with(F &&f) -> decltype(auto) {
         using R = std::invoke_result_t<F, T &, Lock *>;
-        if (lock.has_value()) {
-            lock->lock();
+        if (lock_.has_value()) {
+            lock_->lock();
         }
         if constexpr (std::is_void_v<R>) {
-            f(data, lock.has_value() ? &lock.value() : nullptr);
-            if (lock.has_value()) {
-                lock->unlock();
+            f(data, lock_.has_value() ? &lock_.value() : nullptr);
+            if (lock_.has_value()) {
+                lock_->unlock();
             }
             return;
         } else {
-            auto result = f(data, lock.has_value() ? &lock.value() : nullptr);
-            if (lock.has_value()) {
-                lock->unlock();
+            auto result = f(data, lock_.has_value() ? &lock_.value() : nullptr);
+            if (lock_.has_value()) {
+                lock_->unlock();
             }
             return result;
         }
@@ -172,25 +193,25 @@ public:
     auto with_timed(F &&f) -> decltype(auto) {
         auto lock_time = 0.0;
         using R = std::invoke_result_t<F, T &, Lock *>;
-        if (lock.has_value()) {
+        if (lock_.has_value()) {
             if (enable_time_tracking) {
                 auto t = std::chrono::steady_clock::now();
-                lock->lock();
+                lock_->lock();
                 lock_time = (std::chrono::steady_clock::now() - t).count() * 1e-9;
             } else {
-                lock->lock();
+                lock_->lock();
             }
         }
         if constexpr (std::is_void_v<R>) {
-            f(data, lock.has_value() ? &lock.value() : nullptr);
-            if (lock.has_value()) {
-                lock->unlock();
+            f(data, lock_.has_value() ? &lock_.value() : nullptr);
+            if (lock_.has_value()) {
+                lock_->unlock();
             }
             return lock_time;
         } else {
-            auto result = f(data, lock.has_value() ? &lock.value() : nullptr);
-            if (lock.has_value()) {
-                lock->unlock();
+            auto result = f(data, lock_.has_value() ? &lock_.value() : nullptr);
+            if (lock_.has_value()) {
+                lock_->unlock();
             }
             return std::make_pair(result, lock_time);
         }
@@ -337,21 +358,64 @@ inline const char *to_string(GcMode mode) {
     return "UNKNOWN";
 }
 struct WorkList {
-    std::deque<const GcObjectContainer *> list;
+    // std::vector<const GcObjectContainer *> list;
+    using list_t = detail::LockProtected<detail::spin_lock, std::deque<const GcObjectContainer *>>;
+    std::vector<std::unique_ptr<list_t>> lists;
     void append(const GcObjectContainer *ptr) {
-        list.push_back(ptr);
+        if (lists.size() > 1) {
+            auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lists.size();
+            lists[tid]->with([&](auto &list, auto *lock) {
+                list.push_back(ptr);
+            });
+        } else {
+            lists[0]->get().push_back(ptr);
+        }
     }
     const GcObjectContainer *pop() {
-        GC_ASSERT(!list.empty(), "Work list should not be empty");
-        auto ptr = list.front();
-        list.pop_front();
-        return ptr;
+        list_t *list = nullptr;
+        if (lists.size() > 1) {
+            auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lists.size();
+            list = lists[tid].get();
+        } else {
+            list = lists[0].get();
+        }
+        return list->with([&](auto &list, auto *lock) {
+            GC_ASSERT(!list.empty(), "Work list should not be empty");
+            auto ptr = list.front();
+            list.pop_front();
+            return ptr;
+        });
+    }
+    std::vector<const GcObjectContainer *> pop_n(size_t n) {
+        std::vector<const GcObjectContainer *> result;
+        list_t *list = nullptr;
+        if (lists.size() > 1) {
+            auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id()) % lists.size();
+            list = lists[tid].get();
+        } else {
+            list = lists[0].get();
+        }
+        return list->with([&](auto &list, auto *lock) {
+            for (size_t i = 0; i < n; i++) {
+                result.push_back(list.front());
+                list.pop_front();
+            }
+            return result;
+        });
     }
     bool empty() const {
-        return list.empty();
+        bool empty = true;
+        for (auto &list : lists) {
+            empty &= list->get().empty();
+        }
+        return empty;
     }
     void clear() {
-        list.clear();
+        for (auto &list : lists) {
+            list->with([](auto &list, auto *lock) {
+                list.clear();
+            });
+        }
     }
 };
 
@@ -360,6 +424,7 @@ struct GcOption {
     size_t max_heap_size = 1024 * 1024 * 1024;
     double gc_threshold = 0.8;// when should a gc be triggered
     bool _full_debug = false;
+    std::optional<size_t> n_collector_threads = {};
 };
 // namespace detail {
 // struct new_but_no_delete_memory_resouce : std::pmr::memory_resource {
@@ -469,7 +534,38 @@ auto time_function(F &&f) {
         }
     }
 }
-
+struct ThreadPool {
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::condition_variable has_work;
+    std::atomic<bool> stop = false;
+    std::deque<std::function<void(size_t)>> work;
+public:
+    ThreadPool(size_t n_threads = 4) {
+        for (size_t i = 0; i < n_threads; i++) {
+            threads.emplace_back([this, i] {
+                while (!stop) {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    has_work.wait(lock, [this] { return stop || !work.empty(); });
+                    if (stop) {
+                        return;
+                    }
+                    auto f = std::move(work.front());
+                    work.pop_front();
+                    lock.unlock();
+                    f(i);
+                }
+            });
+        }
+    }
+    ~ThreadPool() {
+        stop = true;
+        has_work.notify_all();
+        for (auto &t : threads) {
+            t.join();
+        }
+    }
+};
 class GcHeap {
     friend struct TracingContext;
     template<class T>
@@ -488,16 +584,19 @@ class GcHeap {
         ATOMIC_MARKING,
         SWEEPING
     };
+    std::optional<ThreadPool> worker_pool_;
     struct Pool {
         size_t allocation_size_ = 0;
         std::unique_ptr<std::pmr::memory_resource> inner;
+        std::vector<std::unique_ptr<std::pmr::memory_resource>> concurrent_resources;
         std::optional<std::pmr::polymorphic_allocator<void>> alloc_;
         ConcurrentState concurrent_state = ConcurrentState::IDLE;
         Pool(GcOption option) {
             if (option._full_debug) {
                 inner = std::make_unique<std::pmr::monotonic_buffer_resource>();
             } else {
-                inner = std::make_unique<std::pmr::unsynchronized_pool_resource>();
+                // inner = std::make_unique<std::pmr::unsynchronized_pool_resource>();
+                inner = std::make_unique<RawHeap>();
             }
             alloc_.emplace(inner.get());
         }
@@ -505,6 +604,41 @@ class GcHeap {
     GcStats stats_;
     struct ObjectList {
         GcObjectContainer *head = nullptr;
+        std::atomic<size_t> count = 0;
+        ObjectList() = default;
+        ObjectList(const ObjectList &list) : head(list.head), count(list.count.load()) {}
+        void insert(GcObjectContainer *ptr) {
+            ptr->next_ = head;
+            head = ptr;
+            count.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    struct ObjectLists {
+        using list_t = detail::LockProtected<detail::spin_lock, ObjectList>;
+        std::vector<std::unique_ptr<detail::LockProtected<detail::spin_lock, ObjectList>>> lists;
+        void push_to_least_full(GcObjectContainer *ptr) {
+            while (true) {
+                auto min = std::numeric_limits<size_t>::max();
+                size_t idx = 0;
+                for (size_t i = 0; i < lists.size(); i++) {
+                    auto count = lists[i]->get().count.load();
+                    if (count < min) {
+                        min = count;
+                        idx = i;
+                    }
+                }
+                if (lists[idx]->lock_enabled()) {
+                    if (lists[idx]->get_lock().try_lock()) {
+                        lists[idx]->get().insert(ptr);
+                        lists[idx]->get_lock().unlock();
+                        return;
+                    }
+                } else {
+                    lists[idx]->get().insert(ptr);
+                    return;
+                }
+            }
+        }
     };
     GcMode mode_ = GcMode::INCREMENTAL;
     size_t max_heap_size_ = 0;
@@ -514,7 +648,7 @@ class GcHeap {
 
     detail::LockProtected<detail::recursive_spinlock, Pool> pool_;
 
-    detail::LockProtected<detail::spin_lock, ObjectList> object_list_;
+    detail::LockProtected<detail::spin_lock, ObjectLists> object_lists_;
     detail::LockProtected<detail::spin_lock, RootSet> root_set_;
     detail::LockProtected<detail::spin_lock, WorkList> work_list;
     std::optional<std::thread> collector_thread_;
@@ -569,9 +703,9 @@ class GcHeap {
     void do_incremental(size_t inc_size) {
         GC_ASSERT(state() != State::SWEEPING, "State should not be sweeping");
         if (state() == State::MARKING) {
-            if constexpr (is_debug) {
-                std::printf("%lld items in work list\n", work_list.get().list.size());
-            }
+            // if constexpr (is_debug) {
+            //     std::printf("%lld items in work list\n", work_list.get().list.size());
+            // }
             auto [mark_end, t_mark] = time_function([this] { return !mark_some(10); });
             stats_.incremental_time += t_mark;
             if (mark_end) {
@@ -746,19 +880,21 @@ public:
             // possible sync issue here
             // while allocation only happens when collector is not in sweeping
             // at this line, the collector might just start sweeping
-            stats_.time_waiting_for_object_list += object_list_.with_timed([&](auto &list, auto *lock) {
-                if (list.head == nullptr) {
-                    list.head = ptr;
-                } else {
-                    ptr->next_ = list.head;
-                    list.head = ptr;
-                }
+            stats_.time_waiting_for_object_list += object_lists_.with_timed([&](auto &lists, auto *lock) {
+                // if (list.head == nullptr) {
+                //     list.head = ptr;
+                // } else {
+                //     ptr->next_ = list.head;
+                //     list.head = ptr;
+                // }
+                lists.push_to_least_full(ptr);
             });
         });
         return ptr;
     }
     void collect();
     void sweep();
+    std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> sweep_list(ObjectList &list);
     void scan_roots();
     bool mark_some(size_t max_count);
     void add_to_working_list(const GcObjectContainer *ptr) {
@@ -782,6 +918,9 @@ public:
         // TODO: what about concurrent mode?
         return state() == State::MARKING;
     }
+    bool is_paralle_collection() const {
+        return worker_pool_.has_value();
+    }
 private:
     void stop() {
         stop_collector_ = true;
@@ -789,7 +928,10 @@ private:
             collector_thread_->join();
         }
         collect();
-        GC_ASSERT(object_list_.get().head == nullptr, "Memory leak detected");
+        // GC_ASSERT(object_lists_.get().head == nullptr, "Memory leak detected");
+        for (auto &list : object_lists_.get().lists) {
+            GC_ASSERT(list->get().head == nullptr, "Memory leak detected");
+        }
     }
 };
 GcHeap &get_heap();

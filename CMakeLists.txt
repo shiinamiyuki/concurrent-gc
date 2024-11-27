@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.26)
 set(CMAKE_CXX_STANDARD 23)
 # enable LTO
 include(CheckIPOSupported)
-add_library(gc STATIC src/gc.h src/gc.cpp src/rc.h src/rc.cpp)
+add_library(gc STATIC src/gc.h src/gc.cpp src/rc.h src/rc.cpp src/heap.h)
 # if linux, link stdc++_libbacktrace
 if (UNIX AND NOT APPLE)
     target_link_libraries(gc stdc++_libbacktrace)

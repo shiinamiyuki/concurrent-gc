@@ -141,19 +141,20 @@ void bench_short_lived_few_update() {
             for (auto j = 0; j < 400; j++) {
                 auto root = C::template make<Node<C, int>>();
                 auto time = std::chrono::high_resolution_clock::now();
-                for (int i = 0; i < 100; i++) {
+                auto n = 100;
+                for (int i = 0; i < n; i++) {
                     auto node = C::template make<Node<C, int>>();
                     node->val = i;
 
                     root->children->push_back(node);
                 }
                 int sum = 0;
-                for (int i = 0; i < 100; i++) {
+                for (int i = 0; i < n; i++) {
                     sum += root->children->at(i)->val;
                     // std::printf("i=%d,node->val=%d\n", i, root->children->at(i)->val);
                     //   std::printf("%lld %p\n",root->children->at(i).control_block_->ref_count, static_cast<void *>(root->children->at(i).control_block_));
                 }
-                GC_ASSERT(sum == 4950, "invalid sum");
+                GC_ASSERT(sum == n*(n-1)/2, "invalid sum");
                 // std::printf("sum = %d\n", sum);
                 // std::printf("%lld %p\n", root.control_block_->ref_count, static_cast<void *>(root.control_block_));
 
@@ -173,10 +174,10 @@ void bench_short_lived_few_update() {
         // gc::GcHeap::destroy();
         policy.finalize();
     };
-    bench(RcPolicy<rc::RefCounter>{});
-    bench(RcPolicy<rc::AtomicRefCounter>{});
+    // bench(RcPolicy<rc::RefCounter>{});
+    // bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 16;
+    option.max_heap_size = 1024 * 32;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::INCREMENTAL;
@@ -434,10 +435,10 @@ void test_hashmap() {
     gc::GcHeap::destroy();
 }
 int main() {
-    // bench_short_lived_few_update();
+    bench_short_lived_few_update();
     // bench_short_lived_frequent_update();
     // bench_random_graph_large();
-    test_concurrent_gc_multithread();
+    // test_concurrent_gc_multithread();
     // test_hashmap();
     return 0;
 }

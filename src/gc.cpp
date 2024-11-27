@@ -26,10 +26,23 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
       max_heap_size_(option.max_heap_size),
       gc_threshold_(option.gc_threshold),
       pool_(detail::emplace_t{}, option.mode == GcMode::CONCURRENT, option),
-      object_list_(ObjectList{}, option.mode == GcMode::CONCURRENT),
+      object_lists_(ObjectLists{}, option.mode == GcMode::CONCURRENT),
       root_set_(RootSet{}, option.mode == GcMode::CONCURRENT),
       work_list(WorkList{}, option.mode == GcMode::CONCURRENT),
       gc_memory_resource_(this) {
+    if (option.n_collector_threads) {
+        worker_pool_.emplace(option.n_collector_threads.value());
+        auto &concurrent_resources = pool_.get().concurrent_resources;
+        auto &lists = object_lists_.get().lists;
+        for (auto i = 0; i < option.n_collector_threads.value(); i++) {
+            concurrent_resources.push_back(std::make_unique<std::pmr::unsynchronized_pool_resource>());
+            lists.emplace_back(std::move(std::make_unique<ObjectLists::list_t>(ObjectList{}, true)));
+        }
+
+    } else {
+        object_lists_.get().lists.emplace_back(std::move(std::make_unique<ObjectLists::list_t>(ObjectList{}, false)));
+        work_list.get().lists.emplace_back(std::move(std::make_unique<WorkList::list_t>(std::deque<const GcObjectContainer *>{}, false)));
+    }
 }
 void GcHeap::signal_collection() {
     if constexpr (is_debug) {
@@ -184,6 +197,7 @@ bool GcHeap::mark_some(size_t max_count) {
         GC_ASSERT(state() == State::MARKING, "State should be marking");
     }
     return work_list.with([&](auto &wl, auto *lock) {
+        std::vector<const GcObjectContainer *> to_scan;
         for (auto i = 0; i < max_count; i++) {
             if (wl.empty()) {
                 return false;
@@ -219,75 +233,112 @@ void GcHeap::scan_roots() {
         }
     });
 }
+std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::sweep_list(ObjectList &object_list) {
+    if constexpr (is_debug) {
+        std::printf("sweeping list\n");
+    }
+    if constexpr (is_debug) {
+        std::printf("starting sweep\n");
+        auto obj_cnt = 0;
+        auto root_cnt = 0;
+        auto reacheable_cnt = 0;
+        auto ptr = object_list.head;
+        while (ptr) {
+            obj_cnt++;
+            if (ptr->is_root()) {
+                root_cnt++;
+                reacheable_cnt++;
+            } else if (ptr->color() == color::BLACK) {
+                reacheable_cnt++;
+            }
+            ptr = ptr->next_;
+        }
+        std::printf("sweeping %d objects, %d roots, %d reacheable\n", obj_cnt, root_cnt, reacheable_cnt);
+    }
+    GcObjectContainer *head = object_list.head;
+    GcObjectContainer *ptr = object_list.head;
+    GcObjectContainer *prev = nullptr;
+    auto cnt = 0ull;
+    auto collect_cnt = 0ull;
+    while (ptr) {
+        auto next = ptr->next_;
+        // if (mode() != GcMode::CONCURRENT) {
+        //     GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
+        // }
+        GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
+        if (ptr->is_root()) {
+            GC_ASSERT(ptr->color() == color::BLACK, "Root should be black");
+        }
+        if (ptr->color() == color::BLACK) {
+            prev = ptr;
+            ptr->set_color(color::WHITE);
+            ptr = next;
+        } else {
+            free_object(ptr);
+            object_list.count.fetch_sub(1, std::memory_order_relaxed);
+            // GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
+            if (!prev) {
+                head = next;
+            } else {
+                prev->next_ = next;
+            }
+            ptr = next;
+            collect_cnt++;
+        }
+        cnt++;
+    }
+    return {collect_cnt, cnt, head, prev};
+}
 void GcHeap::sweep() {
     if (mode_ != GcMode::CONCURRENT) {
         state() = State::SWEEPING;
     }
     auto t = time_function([&] {
-        GcObjectContainer *head = nullptr;
-        GcObjectContainer *ptr = nullptr;
-        GcObjectContainer *prev = nullptr;
-        object_list_.with([&](auto &list, auto *lock) {
-            if constexpr (is_debug) {
-                std::printf("starting sweep\n");
-                auto obj_cnt = 0;
-                auto root_cnt = 0;
-                auto ptr = list.head;
-                while (ptr) {
-                    obj_cnt++;
-                    if (ptr->is_root()) {
-                        root_cnt++;
+        // GcObjectContainer *head = nullptr;
+        // GcObjectContainer *ptr = nullptr;
+        // GcObjectContainer *prev = nullptr;
+        std::vector<ObjectList> object_lists;
+        object_lists_.with([&](auto &lists, auto *lock) {
+            for (auto &list : lists.lists) {
+                list->with([&](auto &list, auto *lock) {
+                    if constexpr (is_debug) {
+                        std::printf("starting sweep\n");
+                        auto obj_cnt = 0;
+                        auto root_cnt = 0;
+                        auto ptr = list.head;
+                        while (ptr) {
+                            obj_cnt++;
+                            if (ptr->is_root()) {
+                                root_cnt++;
+                            }
+                            ptr = ptr->next_;
+                        }
+                        std::printf("sweeping %d objects, %d roots\n", obj_cnt, root_cnt);
                     }
-                    ptr = ptr->next_;
-                }
-                std::printf("sweeping %d objects, %d roots\n", obj_cnt, root_cnt);
+                    object_lists.emplace_back(list);
+                    list.head = nullptr;
+                });
             }
-            head = list.head;
-            ptr = list.head;
-            list.head = nullptr;
         });
         pool_.with([&](auto &pool, auto *lock) {
             pool.concurrent_state = ConcurrentState::SWEEPING;
         });
-        auto cnt = 0ull;
-        auto collect_cnt = 0ull;
-        while (ptr) {
-            auto next = ptr->next_;
-            // if (mode() != GcMode::CONCURRENT) {
-            //     GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
-            // }
-            GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
-            if (ptr->is_root()) {
-                GC_ASSERT(ptr->color() == color::BLACK, "Root should be black");
+        if (is_paralle_collection()) {
+            GC_ASSERT(false, "not implemented");
+        } else {
+            for (int i = 0; i < object_lists.size(); i++) {
+                auto [collect_cnt, cnt, head, prev] = sweep_list(object_lists[i]);
+                stats_.n_collected.fetch_add(collect_cnt, std::memory_order_relaxed);
+                object_lists_.get().lists[i]->with([&](auto &list, auto *lock) {
+                    if (prev) {
+                        GC_ASSERT(head != nullptr, "Head should not be null");
+                        prev->next_ = list.head;
+                        list.head = head;
+                    }
+                });
             }
-            if (ptr->color() == color::BLACK) {
-                prev = ptr;
-                ptr->set_color(color::WHITE);
-                ptr = next;
-            } else {
-                free_object(ptr);
-                // GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
-                if (!prev) {
-                    head = next;
-                } else {
-                    prev->next_ = next;
-                }
-                ptr = next;
-                collect_cnt++;
-            }
-            cnt++;
         }
-        stats_.last_collected = collect_cnt;
-        stats_.ratio_collected.update(static_cast<double>(collect_cnt) / cnt);
-        // });
 
-        object_list_.with([&](auto &list, auto *lock) {
-            if (prev) {
-                GC_ASSERT(head != nullptr, "Head should not be null");
-                prev->next_ = list.head;
-                list.head = head;
-            }
-        });
         if (mode_ != GcMode::CONCURRENT) {
             state() = State::IDLE;
         }
@@ -301,12 +352,23 @@ void GcHeap::collect() {
         if constexpr (is_debug) {
             std::printf("starting full collection\n");
         }
-        auto object_list = object_list_.get();
-        auto ptr = object_list.head;
-        while (ptr) {
-            ptr->set_color(color::WHITE);
-            ptr = ptr->next_;
-        }
+        // auto object_list = object_list_.get();
+        // auto ptr = object_list.head;
+        // while (ptr) {
+        //     ptr->set_color(color::WHITE);
+        //     ptr = ptr->next_;
+        // }
+        object_lists_.with([&](auto &lists, auto *lock) {
+            for (auto &list : lists.lists) {
+                list->with([&](auto &list, auto *lock) {
+                    auto ptr = list.head;
+                    while (ptr) {
+                        ptr->set_color(color::WHITE);
+                        ptr = ptr->next_;
+                    }
+                });
+            }
+        });
         work_list.get().clear();
         if (mode_ != GcMode::CONCURRENT) {
             state() = State::MARKING;
