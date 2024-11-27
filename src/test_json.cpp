@@ -21,7 +21,7 @@ using JsonValueBase = std::variant<
 template<class C>
 struct JsonValue : gc::GarbageCollected<JsonValueBase<C>>, JsonValueBase<C> {
     using Base = JsonValueBase<C>;
-    using Base::Base;
+    // using Base::Base;
     void trace(const gc::Tracer &tracer) const {
         std::visit([&](const auto &v) {
             if constexpr (std::is_same_v<std::decay_t<decltype(v)>, typename C::template Member<JsonDict<C>>>) {
@@ -32,19 +32,22 @@ struct JsonValue : gc::GarbageCollected<JsonValueBase<C>>, JsonValueBase<C> {
         },
                    *this);
     }
+
+    explicit JsonValue(const typename C::template Ptr<JsonDict<C>> &v) : Base(std::monostate{}) {
+        auto &dict = Base::template emplace<typename C::template Member<JsonDict<C>>>(this);
+        // printf("index = %d\n", Base::index());
+        dict = v;
+    }
+    explicit JsonValue(const typename C::template Ptr<JsonArray<C>> &v) : Base(std::monostate{}) {
+        auto &array = Base::template emplace<typename C::template Member<JsonArray<C>>>(this);
+        // printf("index = %d\n", Base::index());
+        array = v;
+    }
     explicit JsonValue(std::monostate = {}) : Base(std::monostate{}) {}
     explicit JsonValue(bool v) : Base(v) {}
     explicit JsonValue(int64_t v) : Base(v) {}
     explicit JsonValue(double v) : Base(v) {}
     explicit JsonValue(const std::string &v) : Base(v) {}
-    explicit JsonValue(const typename C::template Ptr<JsonDict<C>> &v) : Base(std::monostate{}) {
-        auto &dict = Base::template emplace<typename C::template Member<JsonDict<C>>>(this);
-        dict = v;
-    }
-    explicit JsonValue(const typename C::template Ptr<JsonArray<C>> &v) : Base(std::monostate{}) {
-        auto &array = Base::template emplace<typename C::template Member<JsonArray<C>>>(this);
-        array = v;
-    }
     static JsonValue array() {
         return JsonValue(C::template make<JsonArray<C>>());
     }
@@ -118,7 +121,10 @@ struct Parser {
         char c = get();
         if (c == '{') {
             auto dict = parse_dict();
-            return C::template make<JsonValue<C>>(dict.get());
+            typename C::template Ptr<JsonDict<C>> ptr = dict.get();
+            auto v = C::template make<JsonValue<C>>(ptr);
+            // printf("v.index = %d\n", v->index());
+            return v;
         } else if (c == '[') {
             auto array = parse_array();
             return C::template make<JsonValue<C>>(array.get());
@@ -345,6 +351,30 @@ C::template Owned<JsonValue<C>> parse_json(C policy, const std::string &json) {
     return parser.parse_value();
 }
 using StatsTracker = gc::StatsTracker;
+// int main() {
+//     auto src = R"(
+// {
+//     "key1": "value1",
+//     "key2": 123,
+//     "key3": true,
+//     "key4": null,
+//     "key5": {
+//         "key6": "value6",
+//         "key7": 456,
+//         "key8": false,
+//         "key9": null
+//     },
+//     } )";
+//     gc::GcOption option{};
+//     option.max_heap_size = 1024 * 1024 * 1024;
+//     GcPolicy{}.init();
+//     {
+//         auto json = parse_json(GcPolicy{}, src);
+//         std::cout << Formatter<GcPolicy>::format(*json) << std::endl;
+//     }
+//     GcPolicy{}.finalize();
+//     return 0;
+// }
 int main() {
     auto bench = []<class C>(C policy) {
         policy.init();
@@ -361,14 +391,14 @@ int main() {
             auto json = parse_json(policy, json_s);
             auto elapsed = (std::chrono::high_resolution_clock::now() - t).count() * 1e-9;
             tracker.update(elapsed);
-            // std::cout << Formatter<C>::format(*json) << std::endl;
+            std::cout << Formatter<C>::format(*json) << std::endl;
         }
         tracker.print(policy.name().c_str());
         policy.finalize();
     };
 
-    bench(RcPolicy<rc::RefCounter>{});
-    bench(RcPolicy<rc::AtomicRefCounter>{});
+    // bench(RcPolicy<rc::RefCounter>{});
+    // bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
     option.max_heap_size = 1024 * 1024 * 256;
     option.mode = gc::GcMode::INCREMENTAL;
