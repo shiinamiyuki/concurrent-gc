@@ -8,3 +8,12 @@ cd build
 cmake .. -GNinja
 ninja
 ```
+
+## Running Tests
+```bash
+build/test # some microbenchmarks
+wget https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json
+build/test_json # json parsing example
+build/test_raytrace # raytracing example
+
+```
