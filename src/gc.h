@@ -1352,7 +1352,7 @@ class Member {
         if (heap.need_write_barrier()) [[likely]] {
             if (parent_->color() == color::BLACK) {
                 if constexpr (is_debug) {
-                    std::printf("write barrier, color=%d\n", ptr->color());
+                    std::printf("write barrier, color=%d\n", ptr.gc_object_container()->color());
                 }
                 heap.stats_.wait_for_atomic_marking += heap.work_list.with_timed([&](auto &work_list, auto *lock) {
                     heap.shade(ptr.gc_object_container(), work_list.least_filled());

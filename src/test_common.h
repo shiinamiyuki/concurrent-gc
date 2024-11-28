@@ -97,17 +97,6 @@ struct RcPolicy {
     }
 };
 
-#define IMPORT_TYPES()                              \
-    template<class U>                               \
-    using Ptr = typename U::template Ptr<U>;        \
-    template<class U>                               \
-    using Owned = typename U::template Ownedr<U>;   \
-    template<class U>                               \
-    using Member = typename U::template Memberr<U>; \
-    template<class U>                               \
-    using Array = typename U::template Arrayr<U>;   \
-    template<class U>                               \
-    using Enable = typename U::template Enabler<U>;
 
 // https://en.wikipedia.org/wiki/Permuted_congruential_generator
 struct Rng {
