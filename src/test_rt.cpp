@@ -125,9 +125,9 @@ struct Onb : C::template Enable<Onb<C>> {
     explicit Onb(typename C::template Ptr<Vec3> n) : tangent(this), bitangent(this), normal(this) {
         normal = n;
         if (std::abs(normal->x) > std::abs(normal->y)) {
-            tangent = C::make<Vec3>(-normal->z, 0, normal->x)->normalized();
+            tangent = C::template make<Vec3>(-normal->z, 0, normal->x)->normalized();
         } else {
-            tangent = C::make<Vec3>(0, normal->z, -normal->y)->normalized();
+            tangent = C::template make<Vec3>(0, normal->z, -normal->y)->normalized();
         }
         bitangent = normal->cross(*tangent);
     }
@@ -135,7 +135,7 @@ struct Onb : C::template Enable<Onb<C>> {
         auto x = v.dot(*tangent);
         auto y = v.dot(*bitangent);
         auto z = v.dot(*normal);
-        return C::make<Vec3>(x, y, z);
+        return C::template make<Vec3>(x, y, z);
     }
     typename C::template Owned<Vec3> to_world(const Vec3 &v) const {
         return *tangent * v.x + *bitangent * v.y + *normal * v.z;
