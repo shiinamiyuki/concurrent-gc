@@ -74,19 +74,19 @@ struct JsonValue : gc::GarbageCollected<JsonValueBase<C>>, JsonValueBase<C> {
     bool is_dict() const {
         return std::holds_alternative<C::template Member<JsonDict<C>>>(*this);
     }
-    auto as_array() {
+    auto &as_array() {
         return std::get<C::template Member<JsonArray<C>>>(*this);
     }
-    auto as_dict() {
+    auto &as_dict() {
         return std::get<C::template Member<JsonDict<C>>>(*this);
     }
-    auto as_string() {
+    auto &as_string() {
         return std::get<std::string>(*this);
     }
-    auto as_bool() {
+    auto &as_bool() {
         return std::get<bool>(*this);
     }
-    auto as_number() {
+    auto &as_number() {
         return std::get<double>(*this);
     }
 

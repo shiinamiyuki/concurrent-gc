@@ -254,11 +254,12 @@ void render(C policy, int width, int height, bool parallel = false) {
 int main() {
     // the parallel version could run out of memory due to mutators allocates too fast
     // the error during an OOM might not be straightforward due to std::abort() in multithreaded context
-    int w = 800, h = 800;
+    int w = 800*3, h = 800*3;
     render(RcPolicy<rc::RefCounter>{}, w, h);
     render(RcPolicy<rc::AtomicRefCounter>{}, w, h);
+    render(RcPolicy<rc::AtomicRefCounter>{}, w, h, true);
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 1024 * 4;
+    option.max_heap_size = 1024 * 1024 * 64;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     render(GcPolicy{option}, w, h);
     option.mode = gc::GcMode::INCREMENTAL;

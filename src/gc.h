@@ -622,34 +622,35 @@ public:
         }
     }
 };
-template<class T>
-struct tracking_memory_resource : std::pmr::memory_resource {
-    std::unique_ptr<std::pmr::memory_resource> inner;
-    T payload;
-    struct Metadata {
-        tracking_memory_resource *self;
-    };
-    tracking_memory_resource(T payload, std::unique_ptr<std::pmr::memory_resource> inner) : payload(std::move(payload)) {
-        inner = std::move(inner);
-    }
-    void *do_allocate(std::size_t bytes, std::size_t alignment) override {
-        auto actual_size = bytes + sizeof(Metadata);
-        auto ptr = reinterpret_cast<uint8_t *>(inner->allocate(actual_size, alignment));
-        auto metadata = new (ptr + bytes) Metadata{this};
-        return ptr;
-    }
-    void do_deallocate(void *p,
-                       std::size_t bytes,
-                       std::size_t alignment) override {
-        auto ptr = static_cast<uint8_t *>(p);
-        auto metadata = reinterpret_cast<Metadata *>(ptr + bytes);
-        GC_ASSERT(metadata->self == this, "Invalid metadata");
-        inner->deallocate(ptr, bytes + sizeof(Metadata), alignment);
-    }
-    bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
-        return this == &other;
-    }
-};
+// template<class T>
+// struct tracking_memory_resource : std::pmr::memory_resource {
+//     std::unique_ptr<std::pmr::memory_resource> inner;
+//     T payload;
+//     struct Metadata {
+//         tracking_memory_resource *self;
+//     };
+//     tracking_memory_resource(T payload, std::unique_ptr<std::pmr::memory_resource> inner) : payload(std::move(payload)) {
+//         inner = std::move(inner);
+//     }
+//     void *do_allocate(std::size_t bytes, std::size_t alignment) override {
+//         auto actual_size = bytes + sizeof(Metadata);
+//         auto ptr = reinterpret_cast<uint8_t *>(inner->allocate(actual_size, alignment));
+//         auto metadata = new (ptr + bytes) Metadata{this};
+//         return ptr;
+//     }
+//     void do_deallocate(void *p,
+//                        std::size_t bytes,
+//                        std::size_t alignment) override {
+//         auto ptr = static_cast<uint8_t *>(p);
+//         auto metadata = reinterpret_cast<Metadata *>(ptr + bytes);
+//         GC_ASSERT(metadata->self == this, "Invalid metadata");
+//         inner->deallocate(ptr, bytes + sizeof(Metadata), alignment);
+//     }
+//     bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override {
+//         return this == &other;
+//     }
+// };
+extern thread_local std::optional<size_t> tl_pool_idx;
 class GcHeap {
     friend struct TracingContext;
     template<class T>
@@ -766,14 +767,17 @@ class GcHeap {
     // free an object. *Be careful*, this function does not update the head pointer or the next pointer of the object
     void free_object(GcObjectContainer *ptr, size_t pool_idx) {
         GC_ASSERT(ptr->pool_idx_ == pool_idx, "Invalid pool index");
-
-        stats_.n_collected.fetch_add(1, std::memory_order_relaxed);
+        // if (tl_pool_idx.has_value()) {
+        //     // GC_ASSERT(tl_pool_idx.value() == pool_idx, "Invalid pool index");
+        //     printf("tl_pool_idx = %lld, pool_idx = %lld\n", tl_pool_idx.value(), pool_idx);
+        // }
+        // stats_.n_collected.fetch_add(1, std::memory_order_relaxed);
         auto &pool = pool_.get();
         // stats_.time_waiting_for_pool += pool_.with_timed([&](auto &pool, auto *lock) {
         if constexpr (is_debug) {
             std::printf("freeing object %p, size=%lld, %lld/%lldB used\n", static_cast<void *>(ptr), ptr->object_size(), pool.allocation_size_.load(), max_heap_size_);
         }
-        pool.allocation_size_.fetch_sub(ptr->object_size(), std::memory_order_relaxed);
+        // pool.allocation_size_.fetch_sub(ptr->object_size(), std::memory_order_relaxed);
         ptr->set_alive(false);
         auto size = ptr->object_size();
         auto align = ptr->object_alignment();
@@ -895,6 +899,10 @@ class GcHeap {
         void do_deallocate(void *p,
                            std::size_t bytes,
                            std::size_t alignment) override {
+            // if (tl_pool_idx.has_value()) {
+            //     // GC_ASSERT(tl_pool_idx.value() == pool_idx, "Invalid pool index");
+            //     // printf("tl_pool_idx = %lld, pool_idx = %lld\n", tl_pool_idx.value(), pool_idx);
+            // }
             // heap->stats_.time_waiting_for_pool += heap->pool_.with_timed([&](auto &pool, auto *lock) {
             auto &pool = heap->pool_.get();
             pool.allocation_size_.fetch_sub(bytes + sizeof(Metadata), std::memory_order_relaxed);

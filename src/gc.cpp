@@ -28,6 +28,7 @@ void GcHeap::shade(const GcObjectContainer *ptr, size_t pool_idx) {
     }
 }
 static std::shared_ptr<GcHeap> heap;
+thread_local std::optional<size_t> tl_pool_idx;
 GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
     : mode_(option.mode),
       max_heap_size_(option.max_heap_size),
@@ -40,6 +41,9 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
         GC_ASSERT(option.mode != GcMode::INCREMENTAL, "Incremental mode does not support multiple threads");
         GC_ASSERT(option.n_collector_threads.value() > 0, "Number of collector threads should be positive");
         worker_pool_.emplace(option.n_collector_threads.value());
+        worker_pool_->dispatch([&](size_t tid) {
+            tl_pool_idx = tid;
+        });
         auto &concurrent_resources = pool_.get().concurrent_resources;
         auto &lists = object_lists_.get().lists;
         for (auto i = 0; i < option.n_collector_threads.value(); i++) {
@@ -324,6 +328,8 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
     GcObjectContainer *prev = nullptr;
     auto cnt = 0ull;
     auto collect_cnt = 0ull;
+    auto object_ist_cnt = object_list.count.load();
+    auto collected_bytes = 0ull;
     while (ptr) {
         auto next = ptr->next_;
         // if (mode() != GcMode::CONCURRENT) {
@@ -338,8 +344,11 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
             ptr->set_color(color::WHITE);
             ptr = next;
         } else {
+            collected_bytes += ptr->object_size();
             free_object(ptr, pool_idx);
-            object_list.count.fetch_sub(1, std::memory_order_relaxed);
+
+            // object_list.count.fetch_sub(1, std::memory_order_relaxed);
+            object_ist_cnt -= 1;
             // GC_ASSERT(!ptr->is_alive(), "Object should not be alive");
             if (!prev) {
                 head = next;
@@ -351,6 +360,9 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
         }
         cnt++;
     }
+    stats_.n_collected.fetch_add(collect_cnt, std::memory_order_relaxed);
+    pool_.get().allocation_size_.fetch_sub(collected_bytes, std::memory_order_relaxed);
+    object_list.count.store(object_ist_cnt, std::memory_order_relaxed);
     // std::printf("sweeped %d objects, %d collected from pool %lld\n", cnt, collect_cnt, pool_idx);
     return {collect_cnt, cnt, head, prev};
 }
@@ -404,9 +416,9 @@ void GcHeap::sweep() {
             });
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            if constexpr (is_debug) {
-                std::printf("Sweeping list %lld took %f s\n", i, t * 1e-9);
-            }
+            // if constexpr (is_debug) {
+            // std::printf("Sweeping list %lld took %f s\n", i, t * 1e-9);
+            // }
         };
         if (is_paralle_collection()) {
             auto &workers = worker_pool_.value();
@@ -414,9 +426,9 @@ void GcHeap::sweep() {
             workers.dispatch(do_sweep);
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            if constexpr (is_debug) {
-                std::printf("Parallel sweeping took %f s\n", t * 1e-9);
-            }
+            // if constexpr (is_debug) {
+            // std::printf("Parallel sweeping took %f s\n", t * 1e-9);
+            // }
         } else {
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < object_lists.size(); i++) {
@@ -424,9 +436,9 @@ void GcHeap::sweep() {
             }
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            if constexpr (is_debug) {
-                std::printf("sweeping took %f s\n", t * 1e-9);
-            }
+            // if constexpr (is_debug) {
+                // std::printf("sweeping took %f s\n", t * 1e-9);
+            // }
         }
 
         if (mode_ != GcMode::CONCURRENT) {
