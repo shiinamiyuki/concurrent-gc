@@ -254,7 +254,7 @@ void render(C policy, int width, int height, bool parallel = false) {
 int main() {
     // the parallel version could run out of memory due to mutators allocates too fast
     // the error during an OOM might not be straightforward due to std::abort() in multithreaded context
-    int w = 800*3, h = 800*3;
+    int w = 800, h = 800;
     render(RcPolicy<rc::RefCounter>{}, w, h);
     render(RcPolicy<rc::AtomicRefCounter>{}, w, h);
     render(RcPolicy<rc::AtomicRefCounter>{}, w, h, true);

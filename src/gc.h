@@ -15,6 +15,7 @@
 #include <barrier>
 #include <condition_variable>
 #include <cstring>
+#include "pmr-mimalloc.h"
 
 static_assert(sizeof(size_t) == 8, "64-bit only");
 #define GC_ASSERT(x, msg)                                    \
@@ -681,7 +682,7 @@ class GcHeap {
                 if (option._full_debug) {
                     return std::make_unique<std::pmr::monotonic_buffer_resource>();
                 } else {
-                    return std::make_unique<std::pmr::unsynchronized_pool_resource>();
+                    return std::make_unique<mi_memory_sourece>();
                     // inner = std::make_unique<RawHeap>();
                 }
             };
