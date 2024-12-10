@@ -62,10 +62,20 @@ void GcHeap::signal_collection() {
     if constexpr (is_debug) {
         std::printf("Signaling collection\n");
     }
-    pool_.get().concurrent_state = ConcurrentState::REQUESTED;
+    auto &lock = pool_.get_lock();
+    if (pool_.get().concurrent_state != ConcurrentState::IDLE) {
+        return;
+    }
+    lock.unlock_shared();
+    lock.lock();
+    if (pool_.get().concurrent_state == ConcurrentState::IDLE) {
+        pool_.get().concurrent_state = ConcurrentState::REQUESTED;
+    }
+    lock.unlock();
+    lock.lock_shared();
 }
 void GcHeap::do_concurrent(size_t inc_size) {
-    pool_.with([&](auto &pool, auto *lock) {
+    pool_.with_shared([&](auto &pool, auto *lock) {
         auto is_mem_available = [&]() {
             return pool.allocation_size_ + inc_size < max_heap_size_;
         };
@@ -86,7 +96,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
             //     detail::pause_thread();
             //     lock->lock();
             // }
-            lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+            lock->wait_shared([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
         });
         // in concurrent mode, the mutator might allocate too fast such that a single sweep is not enough
         // this is partly due to newly allocated objects are only collected in the next sweep
@@ -99,6 +109,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
                 }
 
                 if (!is_mem_available()) {
+                    std::printf("mem not enough, is %lld, max = %lld\n", pool.allocation_size_.load(), max_heap_size_);
                     GC_ASSERT(pool.concurrent_state != ConcurrentState::IDLE, "State should not be idle");
                     if (pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING) {
                         stats_.wait_for_atomic_marking += time_function([&] {
@@ -110,7 +121,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
                             //     detail::pause_thread();
                             //     lock->lock();
                             // }
-                            lock->wait([this, &pool] {
+                            lock->wait_shared([this, &pool] {
                                 return pool.concurrent_state == ConcurrentState::REQUESTED || pool.concurrent_state == ConcurrentState::MARKING;
                             });
                         });
@@ -124,13 +135,13 @@ void GcHeap::do_concurrent(size_t inc_size) {
                         //     detail::pause_thread();
                         //     lock->lock();
                         // }
-                        lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+                        lock->wait_shared([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
                         // while (pool.concurrent_state != ConcurrentState::IDLE) {
                         //     lock->unlock();
                         //     detail::pause_thread();
                         //     lock->lock();
                         // }
-                        lock->wait([this, &pool] { return pool.concurrent_state != ConcurrentState::IDLE; });
+                        lock->wait_shared([this, &pool] { return pool.concurrent_state != ConcurrentState::IDLE; });
                     });
                 }
                 if (is_mem_available()) {
@@ -140,7 +151,7 @@ void GcHeap::do_concurrent(size_t inc_size) {
         }
         GC_ASSERT(is_mem_available(), "Out of memory");
     },
-               false, true);
+                      false, true);
 }
 void GcHeap::concurrent_collector() {
     while (!stop_collector_.load(std::memory_order_relaxed)) {
@@ -168,6 +179,7 @@ void GcHeap::concurrent_collector() {
         }
 
         auto t = time_function([&]() {
+            std::printf("Concurrent collection, cur mem = %lld\n", pool_.get().allocation_size_.load());
             scan_roots();
             // marking only acquire lock on the work list
             // but not the pool. at this time, the mutator can still allocate and push stuff to the pool
@@ -198,6 +210,7 @@ void GcHeap::concurrent_collector() {
                     std::printf("Concurrent collection done\n");
                 }
             });
+            std::printf("Concurrent collection done, cur mem = %lld\n", pool_.get().allocation_size_.load());
         });
         stats_.collection_time.update(t);
         stats_.n_collection_cycles.fetch_add(1, std::memory_order_relaxed);
@@ -437,7 +450,7 @@ void GcHeap::sweep() {
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
             // if constexpr (is_debug) {
-                // std::printf("sweeping took %f s\n", t * 1e-9);
+            // std::printf("sweeping took %f s\n", t * 1e-9);
             // }
         }
 

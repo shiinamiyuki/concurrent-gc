@@ -101,6 +101,72 @@ struct spin_lock {
     }
 };
 // #endif
+template<class Mutex>
+struct shared_lock {
+    void lock_shared() {
+        mutex.lock();
+        // if(n_readers.load() > 1){
+        //     std::printf("n_readers = %d\n", n_readers.load());
+        // }
+        mutex.wait([&] {
+            return lock_exclusive.load(std::memory_order_relaxed);
+        });
+        n_readers.fetch_add(1, std::memory_order_relaxed);
+        // if(n_readers.load() > 1){
+        //     std::printf("n_readers = %d\n", n_readers.load());
+        // }
+        mutex.unlock();
+    }
+    void unlock_shared() {
+        mutex.lock();
+        n_readers.fetch_sub(1, std::memory_order_relaxed);
+        mutex.unlock();
+    }
+    void lock() {
+        mutex.lock();
+        mutex.wait([&] {
+            return lock_exclusive || n_readers > 0;
+        });
+        lock_exclusive = true;
+        mutex.unlock();
+    }
+    void unlock() {
+        mutex.lock();
+        lock_exclusive = false;
+        mutex.unlock();
+    }
+    template<class F>
+    void wait(F &&f) {
+        auto i = 1;
+        while (f()) {
+            unlock();
+            for (auto j = 0; j < i; j++) {
+                detail::pause_thread();
+            }
+            lock();
+            if (i < 8192)
+                i *= 2;
+        }
+    }
+    template<class F>
+    void wait_shared(F &&f) {
+        auto i = 1;
+        while (f()) {
+            unlock_shared();
+            for (auto j = 0; j < i; j++) {
+                detail::pause_thread();
+            }
+            lock_shared();
+            if (i < 8192)
+                i *= 2;
+        }
+    }
+    shared_lock() = default;
+private:
+    Mutex mutex;
+    std::atomic<bool> lock_exclusive = false;
+    std::atomic<int> n_readers = 0;
+};
 struct recursive_spinlock {
 private:
     spin_lock mutex;
@@ -210,6 +276,31 @@ public:
             if (lock_.has_value()) {
                 if (!no_unlock) {
                     lock_->unlock();
+                }
+            }
+            return result;
+        }
+    }
+    template<class F>
+        requires std::invocable<F, T &, Lock *>
+    auto with_shared(F &&f, bool no_lock = false, bool no_unlock = false) -> decltype(auto) {
+        using R = std::invoke_result_t<F, T &, Lock *>;
+        if (!no_lock && lock_.has_value()) {
+            lock_->lock_shared();
+        }
+        if constexpr (std::is_void_v<R>) {
+            f(data, lock_.has_value() ? &lock_.value() : nullptr);
+            if (lock_.has_value()) {
+                if (!no_unlock) {
+                    lock_->unlock_shared();
+                }
+            }
+            return;
+        } else {
+            auto result = f(data, lock_.has_value() ? &lock_.value() : nullptr);
+            if (lock_.has_value()) {
+                if (!no_unlock) {
+                    lock_->unlock_shared();
                 }
             }
             return result;
@@ -676,7 +767,7 @@ class GcHeap {
         // std::unique_ptr<std::pmr::memory_resource> inner;
         using resouce_t = detail::LockProtected<detail::spin_lock, std::unique_ptr<std::pmr::memory_resource>>;
         std::vector<std::unique_ptr<resouce_t>> concurrent_resources;
-        ConcurrentState concurrent_state = ConcurrentState::IDLE;
+        volatile ConcurrentState concurrent_state = ConcurrentState::IDLE;
         Pool(GcOption option) {
             auto make = [&]() -> std::unique_ptr<std::pmr::memory_resource> {
                 if (option._full_debug) {
@@ -754,7 +845,7 @@ class GcHeap {
 
     // lock order: object_list -> pool
 
-    detail::LockProtected<detail::recursive_spinlock, Pool> pool_;
+    detail::LockProtected<detail::shared_lock<detail::spin_lock>, Pool> pool_;
 
     detail::LockProtected<detail::spin_lock, ObjectLists> object_lists_;
     detail::LockProtected<detail::spin_lock, RootSet> root_set_;
@@ -878,7 +969,7 @@ class GcHeap {
             // if (pool_idx != 0) {
             //     std::printf("allocating from pool %lld\n", pool_idx);
             // }
-            auto [ptr, t] = heap->pool_.with_timed([&](auto &pool, auto *lock) -> void * {
+            auto ptr = heap->pool_.with_shared([&](auto &pool, auto *lock) -> void * {
                 pool.allocation_size_ += bytes + sizeof(Metadata);
                 // auto ptr = reinterpret_cast<uint8_t *>(pool.concurrent_resources.at(pool_idx)->allocate(bytes + sizeof(Metadata), alignment));
                 auto ptr = pool.concurrent_resources.at(pool_idx)->with([&](auto &resource, auto *lock) {
@@ -894,7 +985,7 @@ class GcHeap {
                 return ptr;
             },
                                                    heap->mode() == GcMode::CONCURRENT);
-            heap->stats_.time_waiting_for_pool += t;
+            // heap->stats_.time_waiting_for_pool += t;
             return ptr;
         }
         void do_deallocate(void *p,
@@ -978,7 +1069,8 @@ public:
         }
         prepare_allocation(sizeof(T));
         size_t pool_idx{};
-        auto [ptr, t] = pool_.with_timed([&](Pool &pool, auto *lock) {
+        // auto [ptr, t] =
+        auto ptr = pool_.with_shared([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
                 // GC_ASSERT(pool.concurrent_state != ConcurrentState::SWEEPING, "State should not be sweeping");
                 stats_.wait_for_atomic_marking += time_function([&] {
@@ -990,7 +1082,7 @@ public:
                     //     detail::pause_thread();
                     //     lock->lock();
                     // }
-                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+                    lock->wait_shared([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
                 });
             }
             if (preferred_pool_idx.has_value()) {
@@ -1010,16 +1102,17 @@ public:
                 return ptr;
             });
         },
-                                         mode() == GcMode::CONCURRENT);
+                                     mode() == GcMode::CONCURRENT);
         stats_.n_allocated.fetch_add(1, std::memory_order_relaxed);
-        stats_.time_waiting_for_pool += t;
+        // stats_.time_waiting_for_pool += t;
         auto offset_of_pool_idx = &reinterpret_cast<T *>(ptr)->pool_idx_ - reinterpret_cast<uint8_t *>(ptr);
         std::memcpy(reinterpret_cast<uint8_t *>(ptr) + offset_of_pool_idx, &pool_idx, sizeof(pool_idx));
         new (ptr) T(std::forward<Args>(args)...);// avoid pmr intercepting the allocator
         GC_ASSERT(sizeof(T) == ptr->object_size(), "size should be the same");
         ptr->set_alive(true);
         ptr->pool_idx_ = static_cast<uint8_t>(pool_idx);
-        stats_.time_waiting_for_pool += pool_.with_timed([&](Pool &pool, auto *lock) {
+        // stats_.time_waiting_for_pool += 
+        pool_.with_shared([&](Pool &pool, auto *lock) {
             if (mode() == GcMode::CONCURRENT) {
                 stats_.wait_for_atomic_marking += time_function([&]() {
                     // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
@@ -1027,7 +1120,7 @@ public:
                     //     detail::pause_thread();
                     //     lock->lock();
                     // }
-                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+                    lock->wait_shared([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
                 });
             }
             if (mode() != GcMode::STOP_THE_WORLD) {
