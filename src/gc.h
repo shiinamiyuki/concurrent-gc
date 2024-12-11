@@ -818,7 +818,7 @@ class GcHeap {
         return work_list.get().pop();
     }
     struct gc_ctor_token_t {};
-    void do_incremental(size_t inc_size) {
+    void prepare_allocation_incremental(size_t inc_size) {
         GC_ASSERT(state() != State::SWEEPING, "State should not be sweeping");
         if (state() == State::MARKING) {
             // if constexpr (is_debug) {
@@ -930,13 +930,13 @@ class GcHeap {
     Mutator threads only cares about `pool.allocaion_available_` 
      */
     void signal_collection();
-    void do_concurrent(size_t inc_size);
+    void prepare_allocation_concurrent(size_t inc_size);
     void prepare_allocation(size_t inc_size) {
 
         if (mode_ == GcMode::INCREMENTAL) {
-            do_incremental(inc_size);
+            prepare_allocation_incremental(inc_size);
         } else if (mode_ == GcMode::CONCURRENT) {
-            do_concurrent(inc_size);
+            prepare_allocation_concurrent(inc_size);
         } else {
             if (pool_.get().allocation_size_ + inc_size > max_heap_size_) {
                 collect();

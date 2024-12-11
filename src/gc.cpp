@@ -64,7 +64,7 @@ void GcHeap::signal_collection() {
     }
     pool_.get().concurrent_state = ConcurrentState::REQUESTED;
 }
-void GcHeap::do_concurrent(size_t inc_size) {
+void GcHeap::prepare_allocation_concurrent(size_t inc_size) {
     pool_.with([&](auto &pool, auto *lock) {
         auto is_mem_available = [&]() {
             return pool.allocation_size_ + inc_size < max_heap_size_;
