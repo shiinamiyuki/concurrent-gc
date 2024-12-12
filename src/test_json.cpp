@@ -386,7 +386,7 @@ int main() {
 
     option.mode = gc::GcMode::CONCURRENT;
     bench(GcPolicy{option});
-    option.n_collector_threads = 4;
+    option.n_collector_threads = 2;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
