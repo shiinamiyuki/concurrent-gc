@@ -312,7 +312,7 @@ struct RootSet {
         return roots.size();
     }
 };
-using color_t = uint8_t;
+using color_t = uint32_t;
 class GcObjectContainer {
     // we make this a base class so that we can handle classes that are not traceable
     template<class T>
