@@ -370,7 +370,7 @@ int main() {
             tracker.update(elapsed);
             // std::cout << Formatter<C>::format(*json) << std::endl;
         }
-        tracker.print(policy.name().c_str());
+        tracker.print_latex_table(policy.name().c_str());
         policy.finalize();
     };
 
