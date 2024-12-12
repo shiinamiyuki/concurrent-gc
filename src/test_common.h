@@ -33,7 +33,7 @@ struct GcPolicy {
         std::stringstream ss;
         ss << "GC " << gc::to_string(option.mode);
         if (option.n_collector_threads.has_value()) {
-            ss << " " << option.n_collector_threads.value() << " threads";
+            ss << "@" << option.n_collector_threads.value() << "T";
         }
         return ss.str();
     }

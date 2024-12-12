@@ -139,7 +139,7 @@ void bench_short_lived_few_update() {
         policy.init();
         StatsTracker tracker;
         auto f = [&] {
-            for (auto j = 0; j < 400; j++) {
+            for (auto j = 0; j < 2000; j++) {
                 auto root = C::template make<Node<C, int>>();
                 auto time = std::chrono::high_resolution_clock::now();
                 auto n = 100;
@@ -170,7 +170,7 @@ void bench_short_lived_few_update() {
         f();
         tracker = StatsTracker{};
         f();
-        tracker.print(policy.name().c_str());
+        tracker.print_latex_table(policy.name().c_str());
         // printf("mean = %f\n", tracker.mean);
         // printf("max = %f\n", tracker.max);
         // printf("min = %f\n", tracker.min);
@@ -181,7 +181,7 @@ void bench_short_lived_few_update() {
     bench(RcPolicy<rc::RefCounter>{});
     bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 32;
+    option.max_heap_size = 1024 * 128;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::INCREMENTAL;
@@ -206,7 +206,7 @@ void bench_short_lived_frequent_update() {
         policy.init();
         StatsTracker tracker;
         auto f = [&] {
-            for (auto j = 0; j < 400; j++) {
+            for (auto j = 0; j < 2000; j++) {
                 auto n = 100;
                 auto root = C::template make<Node<C, int>>();
                 auto time = std::chrono::high_resolution_clock::now();
@@ -246,7 +246,7 @@ void bench_short_lived_frequent_update() {
         f();
         tracker = StatsTracker{};
         f();
-        tracker.print(policy.name().c_str());
+        tracker.print_latex_table(policy.name().c_str());
         // printf("mean = %f,", tracker.mean);
         // printf("max = %f,", tracker.max);
         // printf("min = %f,", tracker.min);
@@ -257,7 +257,7 @@ void bench_short_lived_frequent_update() {
     bench(RcPolicy<rc::RefCounter>{});
     bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 16;
+    option.max_heap_size = 1024 * 64;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::INCREMENTAL;
@@ -336,7 +336,7 @@ void bench_random_graph_large() {
             }
         }
         printf("total time = %f\n", tracker.mean * tracker.count);
-        tracker.print("bench random_graph");
+        tracker.print_latex_table(GcPolicy{option}.name().c_str());
         if (gc::enable_time_tracking) {
             gc::get_heap().stats().print();
         }
