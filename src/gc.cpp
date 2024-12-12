@@ -425,9 +425,9 @@ void GcHeap::sweep() {
                 });
             }
         });
-        pool_.with([&](auto &pool, auto *lock) {
-            pool.concurrent_state = ConcurrentState::SWEEPING;
-        });
+        // pool_.with([&](auto &pool, auto *lock) {
+        //     pool.concurrent_state = ConcurrentState::SWEEPING;
+        // });
         auto do_sweep = [&](size_t i) {
             GC_ASSERT(object_lists.size() == object_lists_.get().lists.size(), "Size should be the same");
             auto t0 = std::chrono::high_resolution_clock::now();
