@@ -145,12 +145,14 @@ struct Onb : C::template Enable<Onb<C>> {
 template<class C>
 void render(C policy, int width, int height, bool parallel = false) {
     auto name = policy.name();
-    printf("rendering %s", name.c_str());
+    // printf("rendering %s", name.c_str());
     if (parallel) {
-        printf(" parallel\n");
-    } else {
-        printf("\n");
+        // printf(" parallel\n");
+        name += " parallel";
     }
+    //  else {
+    //     printf("\n");
+    // }
     int n_threads = 4;
     gc::ThreadPool pool{static_cast<size_t>(n_threads)};
     policy.init();
@@ -242,7 +244,8 @@ void render(C policy, int width, int height, bool parallel = false) {
     }
     auto elapsed = (std::chrono::high_resolution_clock::now() - t0).count() * 1e-9;
     policy.finalize();
-    printf("rendering %s took %f s\n", name.c_str(), elapsed);
+    // printf("rendering %s took %f s\n", name.c_str(), elapsed);
+    printf("\\verb|%s| & %f \\\\\n", name.c_str(), elapsed);
     auto output_filename = std::string("output_") + name;
     if (parallel) {
         output_filename += "_parallel";
