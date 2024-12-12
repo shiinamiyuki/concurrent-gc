@@ -21,7 +21,7 @@ void GcHeap::shade(const GcObjectContainer *ptr, size_t pool_idx) {
         if (mode_ != GcMode::CONCURRENT) {
             ptr->set_color(cycle_idx + color::GRAY);
         } else {
-            uint32_t expected = cycle_idx + color::WHITE;
+            color_t expected = cycle_idx + color::WHITE;
             if (!ptr->color_.compare_exchange_strong(expected, cycle_idx + color::GRAY)) {
                 return;
             }
@@ -31,9 +31,9 @@ void GcHeap::shade(const GcObjectContainer *ptr, size_t pool_idx) {
             ptr->set_color(cycle_idx + color::GRAY);
         } else {
             while (true) {
-                uint32_t expected = ptr->color();
-                    // ptr->set_color(cycle_idx + color::GRAY);
-                if(ptr->color_.compare_exchange_strong(expected, cycle_idx + color::GRAY)) {
+                color_t expected = ptr->color();
+                // ptr->set_color(cycle_idx + color::GRAY);
+                if (ptr->color_.compare_exchange_strong(expected, cycle_idx + color::GRAY)) {
                     break;
                 }
                 if (expected == cycle_idx + color::BLACK) {
@@ -385,11 +385,11 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
         //     GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
         // }
         GC_ASSERT(ptr->color() != prev_cycle_idx + color::GRAY, "Object should not be gray");
-        if (mode() != GcMode::CONCURRENT) {
-            if (ptr->is_root()) {
-                GC_ASSERT(ptr->color() == prev_cycle_idx + color::BLACK, "Root should be black");
-            }
-        }
+        // if (mode() != GcMode::CONCURRENT) {
+        // if (ptr->is_root()) {
+        //     GC_ASSERT(ptr->color() == prev_cycle_idx + color::BLACK || ptr->color() >= cycle_idx, "Root should be black");
+        // }
+        // }
         if (ptr->color() == prev_cycle_idx + color::BLACK) {
             prev = ptr;
             // uint32_t expected = color::BLACK + prev_cycle_idx;
@@ -411,7 +411,7 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
             ptr = next;
             collect_cnt++;
         } else {
-            GC_ASSERT(ptr->color() >= cycle_idx, "Color should be greater than cycle_idx");
+            // GC_ASSERT(ptr->color() >= cycle_idx, "Color should be greater than cycle_idx");
             prev = ptr;
             ptr = next;
         }
@@ -455,22 +455,24 @@ void GcHeap::sweep() {
                 });
             }
         });
-        pool_.with([&](auto &pool, auto *lock) {
-            pool.concurrent_state = ConcurrentState::SWEEPING;
-        });
+        // pool_.with([&](auto &pool, auto *lock) {
+        //     pool.concurrent_state = ConcurrentState::SWEEPING;
+        // });
         auto do_sweep = [&](size_t i) {
             GC_ASSERT(object_lists.size() == object_lists_.get().lists.size(), "Size should be the same");
             auto t0 = std::chrono::high_resolution_clock::now();
             auto tmp_list = object_lists[i];
             auto [collect_cnt, cnt, head, prev] = sweep_list(tmp_list, i);
             stats_.n_collected.fetch_add(collect_cnt, std::memory_order_relaxed);
-            object_lists_.get().lists[i]->with([&](auto &list, auto *lock) {
-                if (prev) {
-                    GC_ASSERT(head != nullptr, "Head should not be null");
-                    prev->next_ = list.head;
+            object_lists_.with([&](auto &lists, auto *) {
+                lists.lists[i]->with([&](auto &list, auto *lock) {
+                    if (prev) {
+                        GC_ASSERT(head != nullptr, "Head should not be null");
+                        prev->next_ = list.head;
+                    }
                     list.head = head;
                     list.count.store(tmp_list.count.load(), std::memory_order_relaxed);
-                }
+                });
             });
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();

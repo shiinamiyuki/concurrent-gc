@@ -312,7 +312,7 @@ struct RootSet {
         return roots.size();
     }
 };
-
+using color_t = uint8_t;
 class GcObjectContainer {
     // we make this a base class so that we can handle classes that are not traceable
     template<class T>
@@ -321,7 +321,7 @@ class GcObjectContainer {
     friend class GcPtr;
 protected:
     friend class GcHeap;
-    mutable std::atomic<uint32_t> color_;
+    mutable std::atomic<color_t> color_;
     mutable bool alive = true;
     uint8_t pool_idx_;
     mutable std::atomic<uint16_t> root_ref_count = 0;
@@ -332,7 +332,7 @@ protected:
     void set_alive(bool value) const {
         alive = value;
     }
-    void set_color(uint32_t value) const {
+    void set_color(color_t value) const {
         color_.store(value, std::memory_order_relaxed);
     }
     void inc_root_ref_count() const {
@@ -350,7 +350,7 @@ public:
         // return root_ref_count > 0;
         return root_node.has_value();
     }
-    uint32_t color() const {
+    color_t color() const {
         return color_.load(std::memory_order_relaxed);
     }
     bool is_alive() const {
@@ -719,7 +719,7 @@ class GcHeap {
             }
         }
     };
-    uint32_t cycle_idx = 0;
+    color_t cycle_idx = 0;
     void inc_cycle() {
         cycle_idx += 2;
     }
@@ -830,6 +830,7 @@ class GcHeap {
             std::printf("scanning %p from pool %lld\n", static_cast<const void *>(ptr), pool_idx);
             std::fflush(stdout);
         }
+        GC_ASSERT(ptr->color() >= cycle_idx, "Object should be gray or black");
         if (mode() != GcMode::CONCURRENT) {
             GC_ASSERT(ptr->color() == cycle_idx + color::GRAY || ptr->is_root(), "Object should be gray");
         }
@@ -840,7 +841,19 @@ class GcHeap {
         if (auto traceable = ptr->as_tracable()) {
             traceable->trace(Tracer{ctx});
         }
-        ptr->set_color(cycle_idx + color::BLACK);
+        if (mode() != GcMode::CONCURRENT) {
+            ptr->set_color(cycle_idx + color::BLACK);
+        }else{
+            while(true) {
+                auto old_color = ptr->color();
+                if (old_color == cycle_idx + color::BLACK) {
+                    return;
+                }
+                if (ptr->color_.compare_exchange_weak(old_color, cycle_idx + color::BLACK, std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+        }
     }
     const GcObjectContainer *pop_from_working_list() {
         return work_list.get().pop();
@@ -1050,6 +1063,7 @@ public:
         ptr->set_alive(true);
         ptr->pool_idx_ = static_cast<uint8_t>(pool_idx);
         stats_.time_waiting_for_pool += pool_.with_timed([&](Pool &pool, auto *lock) {
+            ptr->set_color(cycle_idx + color::WHITE);
             if (mode() == GcMode::CONCURRENT) {
                 stats_.wait_for_atomic_marking += time_function([&]() {
                     // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
