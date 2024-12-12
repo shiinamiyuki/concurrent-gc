@@ -40,7 +40,7 @@ static_assert(sizeof(size_t) == 8, "64-bit only");
         if (!(x)) [[unlikely]] {                             \
             std::cerr << "Assertion failed: at "             \
                       << __FILE__ << ":" << __LINE__ << "\n" \
-                      << msg << "\n" std::abort();           \
+                      << msg << "\n"; std::abort();           \
         }                                                    \
     } while (0)
 #endif
