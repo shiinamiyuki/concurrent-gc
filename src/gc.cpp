@@ -48,13 +48,13 @@ GcHeap::GcHeap(GcOption option, gc_ctor_token_t)
         auto &lists = object_lists_.get().lists;
         for (auto i = 0; i < option.n_collector_threads.value(); i++) {
             lists.emplace_back(std::move(std::make_unique<ObjectLists::list_t>(ObjectList{}, true)));
-            work_list.get().lists.emplace_back(std::move(std::make_unique<WorkList::list_t>(std::deque<const GcObjectContainer *>{}, false)));
+            work_list.get().lists.emplace_back(std::move(std::make_unique<WorkList::list_t>(std::vector<const GcObjectContainer *>{}, false)));
             gc_memory_resource_.emplace_back(this, i);
         }
 
     } else {
         object_lists_.get().lists.emplace_back(std::move(std::make_unique<ObjectLists::list_t>(ObjectList{}, false)));
-        work_list.get().lists.emplace_back(std::move(std::make_unique<WorkList::list_t>(std::deque<const GcObjectContainer *>{}, false)));
+        work_list.get().lists.emplace_back(std::move(std::make_unique<WorkList::list_t>(std::vector<const GcObjectContainer *>{}, false)));
         gc_memory_resource_.emplace_back(this, 0);
     }
 }
@@ -230,33 +230,48 @@ void GcHeap::parallel_marking() {
     auto &workers = worker_pool_.value();
     work_list.with([&](auto &wl, auto *lock) {
         auto mark = [&](size_t pool_idx) {
+            auto t0 = std::chrono::high_resolution_clock::now();
             if constexpr (is_debug) {
                 std::printf("Worker %lld started\n", pool_idx);
             }
             auto cnt = 0;
             wl.lists.at(pool_idx)->with([&](auto &list, auto *lock) {
+                if constexpr (verbose_output) {
+                    std::printf("Worker %lld has %lld items\n", pool_idx, list.size());
+                }
                 // auto&list = wl.lists.at(pool_idx)->get();
                 while (!list.empty()) {
                     if constexpr (is_debug) {
                         std::printf("Worker %lld has %lld items\n", pool_idx, list.size());
                     }
-                    auto ptr = list.front();
-                    list.pop_front();
+                    auto ptr = list.back();
+                    list.pop_back();
                     scan(ptr, pool_idx);
                     cnt++;
                 }
             });
             // std::printf("Worker %lld processed %lld items\n", pool_idx, cnt);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto t = (t1 - t0).count();
+            if constexpr (verbose_output) {
+                std::printf("Worker %lld took %f ms\n", pool_idx, t * 1e-6);
+            }
         };
-        // auto t0 =std::chrono::high_resolution_clock::now();
+        auto t0 = std::chrono::high_resolution_clock::now();
         workers.dispatch(mark);
-        // auto t1 = std::chrono::high_resolution_clock::now();
-        // auto t = (t1 - t0).count();
-        // std::printf("Parallel marking took %f s\n", t*1e-9);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        auto t = (t1 - t0).count();
+        if constexpr (verbose_output) {
+            std::printf("Parallel marking took %f ms\n", t * 1e-6);
+        }
 
+        // auto t0 = std::chrono::high_resolution_clock::now();
         // for (auto i = 0; i < wl.lists.size(); i++) {
         //     mark(i);
         // }
+        // auto t1 = std::chrono::high_resolution_clock::now();
+        // auto t = (t1 - t0).count();
+        // std::printf("Parallel marking took %f ms\n", t * 1e-6);
     });
 }
 bool GcHeap::mark_some(size_t max_count) {
@@ -280,6 +295,7 @@ void GcHeap::scan_roots() {
     if (mode_ != GcMode::CONCURRENT) {
         state() = State::MARKING;
     }
+    auto t0 = std::chrono::high_resolution_clock::now();
     root_set_.with([&](RootSet &rs, auto *lock) {
         if constexpr (is_debug) {
             std::printf("scanning %lld roots\n", rs.size());
@@ -301,6 +317,11 @@ void GcHeap::scan_roots() {
             });
         }
     });
+    auto t1 = std::chrono::high_resolution_clock::now();
+    if constexpr (verbose_output) {
+        auto t = (t1 - t0).count();
+        std::printf("Scanning roots took %f ms\n", t * 1e-6);
+    }
 }
 std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::sweep_list(ObjectList &object_list, size_t pool_idx) {
     if constexpr (is_debug) {
@@ -363,7 +384,7 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
     stats_.n_collected.fetch_add(collect_cnt, std::memory_order_relaxed);
     pool_.get().allocation_size_.fetch_sub(collected_bytes, std::memory_order_relaxed);
     object_list.count.store(object_ist_cnt, std::memory_order_relaxed);
-    // std::printf("sweeped %d objects, %d collected from pool %lld\n", cnt, collect_cnt, pool_idx);
+    if constexpr (verbose_output) { std::printf("sweeped %d objects, %d collected from pool %lld\n", cnt, collect_cnt, pool_idx); }
     return {collect_cnt, cnt, head, prev};
 }
 void GcHeap::sweep() {
@@ -416,9 +437,9 @@ void GcHeap::sweep() {
             });
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            // if constexpr (is_debug) {
-            // std::printf("Sweeping list %lld took %f s\n", i, t * 1e-9);
-            // }
+            if constexpr (verbose_output) {
+                std::printf("Sweeping list %lld took %f s\n", i, t * 1e-9);
+            }
         };
         if (is_paralle_collection()) {
             auto &workers = worker_pool_.value();
@@ -426,9 +447,9 @@ void GcHeap::sweep() {
             workers.dispatch(do_sweep);
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            // if constexpr (is_debug) {
-            // std::printf("Parallel sweeping took %f s\n", t * 1e-9);
-            // }
+            if constexpr (verbose_output) {
+                std::printf("Parallel sweeping took %f s\n", t * 1e-9);
+            }
         } else {
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int i = 0; i < object_lists.size(); i++) {
@@ -436,9 +457,9 @@ void GcHeap::sweep() {
             }
             auto t1 = std::chrono::high_resolution_clock::now();
             auto t = (t1 - t0).count();
-            // if constexpr (is_debug) {
-                // std::printf("sweeping took %f s\n", t * 1e-9);
-            // }
+            if constexpr (verbose_output) {
+                std::printf("sweeping took %f s\n", t * 1e-9);
+            }
         }
 
         if (mode_ != GcMode::CONCURRENT) {
@@ -451,7 +472,7 @@ void GcHeap::sweep() {
 void GcHeap::collect() {
 
     auto t = time_function([&]() {
-        if constexpr (is_debug) {
+        if constexpr (verbose_output) {
             std::printf("starting full collection\n");
         }
         // auto object_list = object_list_.get();
@@ -477,18 +498,31 @@ void GcHeap::collect() {
         }
         scan_roots();
         if (is_paralle_collection()) {
+            auto t0 = std::chrono::high_resolution_clock::now();
             parallel_marking();
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto t = (t1 - t0).count();
+            if constexpr (verbose_output) {
+                std::printf("Parallel marking took %f ms\n", t * 1e-6);
+            }
         } else {
+            auto t0 = std::chrono::high_resolution_clock::now();
             while (mark_some(10)) {}
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto t = (t1 - t0).count();
+            if constexpr (verbose_output) {
+                std::printf("Marking took %f ms\n", t * 1e-6);
+            }
         }
         GC_ASSERT(work_list.get().empty(), "Work list should be empty");
         sweep();
-        if constexpr (is_debug) {
-            std::printf("full collection done\n");
-        }
-    });
+    },
+                           true);
     if (stats_.incremental_time > 0.0) {
         t += stats_.incremental_time;
+    }
+    if constexpr (verbose_output) {
+        std::printf("full collection took %f ms\n", t * 1e3);
     }
     stats_.collection_time.update(t);
     stats_.n_collection_cycles.fetch_add(1, std::memory_order_relaxed);

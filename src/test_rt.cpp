@@ -259,7 +259,7 @@ int main() {
     render(RcPolicy<rc::AtomicRefCounter>{}, w, h);
     render(RcPolicy<rc::AtomicRefCounter>{}, w, h, true);
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 1024 * 64;
+    option.max_heap_size = 1024 * 1024 * 256;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     render(GcPolicy{option}, w, h);
     option.mode = gc::GcMode::INCREMENTAL;
@@ -268,7 +268,7 @@ int main() {
     render(GcPolicy{option}, w, h);
     render(GcPolicy{option}, w, h, true);
     option.mode = gc::GcMode::STOP_THE_WORLD;
-    option.n_collector_threads = 4;
+    option.n_collector_threads = 2;
     render(GcPolicy{option}, w, h);
     option.mode = gc::GcMode::CONCURRENT;
     render(GcPolicy{option}, w, h);

@@ -186,7 +186,7 @@ void bench_short_lived_few_update() {
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
     bench(GcPolicy{option});
-    option.n_collector_threads = 4;
+    option.n_collector_threads = 2;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
@@ -261,7 +261,7 @@ void bench_short_lived_frequent_update() {
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
     bench(GcPolicy{option});
-    option.n_collector_threads = 4;
+    option.n_collector_threads = 2;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::CONCURRENT;
@@ -276,7 +276,7 @@ void bench_random_graph_large() {
         option.mode = mode;
         option.max_heap_size = 1024 * 1024 * 256;
         if (parallel) {
-            option.n_collector_threads = 4;
+            option.n_collector_threads = 2;
         }
         printf("benchmarking %s\n", GcPolicy{option}.name().c_str());
         gc::GcHeap::init(option);

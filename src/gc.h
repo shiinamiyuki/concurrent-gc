@@ -35,7 +35,7 @@ constexpr bool is_debug = true;
 #else
 constexpr bool is_debug = false;
 #endif
-constexpr bool verbose_output = true;
+constexpr bool verbose_output = false;
 extern bool enable_time_tracking;
 
 namespace detail {
@@ -391,7 +391,7 @@ inline const char *to_string(GcMode mode) {
 }
 struct WorkList {
     // std::vector<const GcObjectContainer *> list;
-    using list_t = detail::LockProtected<detail::spin_lock, std::deque<const GcObjectContainer *>>;
+    using list_t = detail::LockProtected<detail::spin_lock, std::vector<const GcObjectContainer *>>;
     std::vector<std::unique_ptr<list_t>> lists;
     void append(const GcObjectContainer *ptr) {
         // if (lists.size() > 1) {
@@ -424,8 +424,8 @@ struct WorkList {
 
         return list->with([&](auto &list, auto *lock) {
             GC_ASSERT(!list.empty(), "Work list should not be empty");
-            auto ptr = list.front();
-            list.pop_front();
+            auto ptr = list.back();
+            list.pop_back();
             return ptr;
         });
     }
@@ -550,8 +550,8 @@ struct GcStats {
     }
 };
 template<class F, typename R = std::invoke_result_t<F>>
-auto time_function(F &&f) {
-    if (enable_time_tracking) {
+auto time_function(F &&f, bool always=false) {
+    if (enable_time_tracking || always) {
         if constexpr (std::is_same_v<R, void>) {
             auto start = std::chrono::high_resolution_clock::now();
             f();
@@ -682,7 +682,8 @@ class GcHeap {
                 if (option._full_debug) {
                     return std::make_unique<std::pmr::monotonic_buffer_resource>();
                 } else {
-                    return std::make_unique<mi_memory_sourece>();
+                    return std::make_unique<std::pmr::unsynchronized_pool_resource>();
+                    // return std::make_unique<mi_memory_sourece>();
                     // inner = std::make_unique<RawHeap>();
                 }
             };
@@ -739,7 +740,7 @@ class GcHeap {
             auto min = std::numeric_limits<size_t>::max();
             size_t idx = 0;
             for (size_t i = 0; i < lists.size(); i++) {
-                auto count = lists[i]->get().count.load();
+                auto count = lists[i]->get().count.load(std::memory_order_relaxed);
                 if (count < min) {
                     min = count;
                     idx = i;
