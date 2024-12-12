@@ -11,7 +11,7 @@ add_library(gc STATIC src/gc.h src/gc.cpp src/rc.h src/rc.cpp src/pmr-mimalloc.h
 target_link_libraries(gc PUBLIC mimalloc-static)
 # if linux, link stdc++_libbacktrace
 if (UNIX AND NOT APPLE)
-    target_link_libraries(gc stdc++_libbacktrace)
+    target_link_libraries(gc PUBLIC stdc++_libbacktrace)
     target_compile_options(gc PUBLIC -Wno-format)
 endif()
 
