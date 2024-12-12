@@ -125,6 +125,7 @@ void test_wb() {
             std::printf("z->val = %d\n", z->val);
         }
     }
+    gc::GcHeap::destroy();
 }
 
 void bench_short_lived_few_update() {
@@ -165,14 +166,15 @@ void bench_short_lived_few_update() {
                 // std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         };
-        printf("benchmarking %s\n", policy.name().c_str());
+        // printf("benchmarking %s\n", policy.name().c_str());
         f();
         tracker = StatsTracker{};
         f();
-        printf("mean = %f\n", tracker.mean);
-        printf("max = %f\n", tracker.max);
-        printf("min = %f\n", tracker.min);
-        printf("variance = %f\n", tracker.variance());
+        tracker.print(policy.name().c_str());
+        // printf("mean = %f\n", tracker.mean);
+        // printf("max = %f\n", tracker.max);
+        // printf("min = %f\n", tracker.min);
+        // printf("variance = %f\n", tracker.variance());
         // gc::GcHeap::destroy();
         policy.finalize();
     };
@@ -240,14 +242,15 @@ void bench_short_lived_frequent_update() {
                 // std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         };
-        printf("benchmarking %s\n", policy.name().c_str());
+        // printf("benchmarking %s\n", policy.name().c_str());
         f();
         tracker = StatsTracker{};
         f();
-        printf("mean = %f\n", tracker.mean);
-        printf("max = %f\n", tracker.max);
-        printf("min = %f\n", tracker.min);
-        printf("variance = %f\n", tracker.variance());
+        tracker.print(policy.name().c_str());
+        // printf("mean = %f,", tracker.mean);
+        // printf("max = %f,", tracker.max);
+        // printf("min = %f,", tracker.min);
+        // printf("variance = %f\n", tracker.variance());
         // gc::GcHeap::destroy();
         policy.finalize();
     };
@@ -454,6 +457,7 @@ void test_hashmap() {
     gc::GcHeap::destroy();
 }
 int main() {
+    // test_wb();
     bench_short_lived_few_update();
     bench_short_lived_frequent_update();
     bench_random_graph_large();
