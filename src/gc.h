@@ -323,6 +323,7 @@ protected:
     friend class GcHeap;
     mutable std::atomic<color_t> color_;
     mutable bool alive = true;
+    uint8_t _pad[3]{};
     uint8_t pool_idx_;
     mutable std::atomic<uint16_t> root_ref_count = 0;
     /// @brief if we were using rust, the below field might only take 8 bytes...
@@ -336,10 +337,10 @@ protected:
         color_.store(value, std::memory_order_relaxed);
     }
     void inc_root_ref_count() const {
-        root_ref_count.fetch_add(1, std::memory_order_relaxed);
+        root_ref_count.fetch_add(1, std::memory_order_acquire);
     }
     void dec_root_ref_count() const {
-        root_ref_count.fetch_sub(1, std::memory_order_relaxed);
+        root_ref_count.fetch_sub(1, std::memory_order_release);
     }
 public:
     GcObjectContainer();
@@ -674,6 +675,18 @@ public:
 //     }
 // };
 extern thread_local std::optional<size_t> tl_pool_idx;
+namespace detail {
+inline void check_alive(const GcObjectContainer *ptr) {
+
+    if (!ptr) {
+        return;
+    }
+    GC_ASSERT(ptr->is_alive(), "Dangling pointer detected");
+
+    return;
+}
+}// namespace detail
+
 class GcHeap {
     friend class GcObjectContainer;
     friend struct TracingContext;
@@ -826,10 +839,12 @@ class GcHeap {
         if (!ptr) {
             return;
         }
+
         if constexpr (is_debug) {
             std::printf("scanning %p from pool %lld\n", static_cast<const void *>(ptr), pool_idx);
             std::fflush(stdout);
         }
+        detail::check_alive(ptr);
         GC_ASSERT(ptr->color() >= cycle_idx, "Object should be gray or black");
         if (mode() != GcMode::CONCURRENT) {
             GC_ASSERT(ptr->color() == cycle_idx + color::GRAY || ptr->is_root(), "Object should be gray");
@@ -843,8 +858,8 @@ class GcHeap {
         }
         if (mode() != GcMode::CONCURRENT) {
             ptr->set_color(cycle_idx + color::BLACK);
-        }else{
-            while(true) {
+        } else {
+            while (true) {
                 auto old_color = ptr->color();
                 if (old_color == cycle_idx + color::BLACK) {
                     return;
@@ -1091,6 +1106,7 @@ public:
                 //     ptr->next_ = list.head;
                 //     list.head = ptr;
                 // }
+                GC_ASSERT(ptr->color_ >= cycle_idx, "Object should be current cycle");
                 lists.lists.at(pool_idx)->with([&](auto &list, auto *lock) {
                     list.insert(ptr);
                 });
@@ -1150,17 +1166,6 @@ private:
     }
 };
 GcHeap &get_heap();
-namespace detail {
-inline bool check_alive(const GcObjectContainer *ptr) {
-    if constexpr (is_debug) {
-        if (!ptr) {
-            return true;
-        }
-        GC_ASSERT(ptr->is_alive(), "Dangling pointer detected");
-    }
-    return true;
-}
-}// namespace detail
 
 /// Thank you, C++
 template<typename T>
@@ -1261,6 +1266,7 @@ class Local {
     GcPtr<T> ptr_;
     void inc() {
         if (ptr_.gc_object_container()) {
+            detail::check_alive(ptr_.gc_object_container());
             ptr_.gc_object_container()->inc_root_ref_count();
             if (ptr_.gc_object_container()->root_ref_count == 1) {
                 // become a new root, add to the root set
@@ -1282,6 +1288,7 @@ class Local {
     }
     void dec() {
         if (ptr_.gc_object_container()) {
+            detail::check_alive(ptr_.gc_object_container());
             ptr_.gc_object_container()->dec_root_ref_count();
             if (ptr_.gc_object_container()->root_ref_count == 0) {
                 // remove from the root set
@@ -1351,12 +1358,12 @@ public:
         return *this;
     }
     Local &operator=(const Local &other) {
-        if (ptr_ == other.ptr_) {
+        if (this == &other) {
             return *this;
         }
+        other.inc();
         dec();
         ptr_ = other.ptr_;
-        inc();
         return *this;
     }
     Local &operator=(const Member<T> &member) {

@@ -17,6 +17,7 @@ void GcHeap::shade(const GcObjectContainer *ptr, size_t pool_idx) {
     if (!ptr || ptr->color() == cycle_idx + color::GRAY || ptr->color() == cycle_idx + color::BLACK)
         return;
     detail::check_alive(ptr);
+    GC_ASSERT(ptr->color() >= cycle_idx, "Object should be current cycle");
     if (is_paralle_collection()) {
         if (mode_ != GcMode::CONCURRENT) {
             ptr->set_color(cycle_idx + color::GRAY);
@@ -89,13 +90,7 @@ void GcHeap::prepare_allocation_concurrent(size_t inc_size) {
             return pool.allocation_size_ + inc_size < max_heap_size_;
         };
         auto threshold = [&]() -> bool {
-            auto time_threshold = [&]() {
-                auto now = std::chrono::high_resolution_clock::now();
-                auto since_last_collection = now - stats_.last_collect_time;
-                return since_last_collection > std::chrono::seconds(1);
-            };
-            return true;
-            // return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected;
+            return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected;
         };
         stats_.wait_for_atomic_marking += time_function([&] {
             // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
@@ -398,6 +393,7 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
             ptr = next;
         } else if (ptr->color() == prev_cycle_idx + color::WHITE) {
             collected_bytes += ptr->object_size();
+            GC_ASSERT(!ptr->is_root(), "Object should not be root");
             free_object(ptr, pool_idx);
 
             // object_list.count.fetch_sub(1, std::memory_order_relaxed);
