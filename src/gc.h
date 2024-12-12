@@ -9,7 +9,11 @@
 #include <iostream>
 #include <optional>
 #include <thread>
+#if defined(__x86_64__) || defined(_M_X64) || defined(_WIN64)
 #include <emmintrin.h>
+#else// aaarch64
+#include <sched.h>
+#endif
 #include <mutex>
 #include <list>
 #include <barrier>
@@ -54,6 +58,8 @@ namespace detail {
 inline void pause_thread() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(_WIN64)
     _mm_pause();
+#elif defined(__aarch64__)
+    sched_yield();
 #else
     std::this_thread::yield();
 #endif
@@ -550,7 +556,7 @@ struct GcStats {
     }
 };
 template<class F, typename R = std::invoke_result_t<F>>
-auto time_function(F &&f, bool always=false) {
+auto time_function(F &&f, bool always = false) {
     if (enable_time_tracking || always) {
         if constexpr (std::is_same_v<R, void>) {
             auto start = std::chrono::high_resolution_clock::now();
