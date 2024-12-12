@@ -59,18 +59,25 @@ auto find_all_nodes(typename C::template Ptr<Node<C, T>> root) {
     std::unordered_set<typename C::template Ptr<Node<C, T>>>
         visited;
     using N = C::template Ptr<Node<C, T>>;
-    std::function<void(N)> dfs = [&](C::template Ptr<Node<C, T>> node) {
+    // std::function<void(N)> dfs = [&](C::template Ptr<Node<C, T>> node) {
+
+    // };
+    // dfs(root);
+    std::vector<typename C::template Ptr<Node<C, T>>> stack;
+    stack.push_back(root);
+    while (!stack.empty()) {
+        auto node = stack.back();
+        stack.pop_back();
         if (visited.contains(node)) {
-            return;
+            continue;
         }
         visited.insert(node);
         nodes.push_back(node);
         auto num_children = node->children->size();
         for (auto i = 0; i < num_children; i++) {
-            dfs(node->children->at(i));
+            stack.push_back(node->children->at(i));
         }
-    };
-    dfs(root);
+    }
     return nodes;
 }
 
@@ -181,7 +188,8 @@ void bench_short_lived_few_update() {
     bench(RcPolicy<rc::RefCounter>{});
     bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 128;
+    option._full_debug = true;
+    option.max_heap_size = 1024 * 256;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::INCREMENTAL;
@@ -257,7 +265,7 @@ void bench_short_lived_frequent_update() {
     bench(RcPolicy<rc::RefCounter>{});
     bench(RcPolicy<rc::AtomicRefCounter>{});
     gc::GcOption option{};
-    option.max_heap_size = 1024 * 64;
+    option.max_heap_size = 1024 * 256;
     option.mode = gc::GcMode::STOP_THE_WORLD;
     bench(GcPolicy{option});
     option.mode = gc::GcMode::INCREMENTAL;

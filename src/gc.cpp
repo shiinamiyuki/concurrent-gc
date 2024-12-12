@@ -15,6 +15,7 @@ void GcHeap::shade(const GcObjectContainer *ptr, size_t pool_idx) {
     }
     if (!ptr || ptr->color() != color::WHITE)
         return;
+    detail::check_alive(ptr);
     if (is_paralle_collection()) {
         uint8_t expected = color::WHITE;
         if (!ptr->color_.compare_exchange_strong(expected, color::GRAY)) {
@@ -75,7 +76,7 @@ void GcHeap::prepare_allocation_concurrent(size_t inc_size) {
                 auto since_last_collection = now - stats_.last_collect_time;
                 return since_last_collection > std::chrono::seconds(1);
             };
-            return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected && time_threshold();
+            return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected;
         };
         stats_.wait_for_atomic_marking += time_function([&] {
             // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
@@ -93,8 +94,13 @@ void GcHeap::prepare_allocation_concurrent(size_t inc_size) {
         auto n_retry = 2;
         for (auto r = 0; r < n_retry; r++) {
             if (!is_mem_available() || threshold()) {
+                if constexpr (is_debug) {
+                    std::printf("should signal collection, alloc_size = %lld, max_heap_size = %lld\n", pool.allocation_size_.load(), max_heap_size_);
+                }
                 if (pool.concurrent_state == ConcurrentState::IDLE) {
-                    // std::printf("stats_.n_allocated = %lld\n stats_.n_collected = %lld\n stats_.last_collected = %lld\n", stats_.n_allocated.load(), stats_.n_collected.load(), stats_.last_collected);
+                    if constexpr (is_debug) {
+                        std::printf("signal collection, stats_.n_allocated = %lld\n stats_.n_collected = %lld\n stats_.last_collected = %lld\n", stats_.n_allocated.load(), stats_.n_collected.load(), stats_.last_collected);
+                    }
                     signal_collection();
                 }
 
@@ -159,7 +165,7 @@ void GcHeap::concurrent_collector() {
             // std::printf("state = %d\n", pool.concurrent_state);
             GC_ASSERT(pool.concurrent_state == ConcurrentState::REQUESTED, "Mutator should request collection");
             pool.concurrent_state = ConcurrentState::MARKING;
-            if constexpr (is_debug) {
+            if constexpr (verbose_output) {
                 std::printf("Starting concurrent collection\n");
             }
         });
@@ -181,7 +187,7 @@ void GcHeap::concurrent_collector() {
                 GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
                 pool.concurrent_state = ConcurrentState::ATOMIC_MARKING;
 
-                if constexpr (is_debug) {
+                if constexpr (verbose_output) {
                     std::printf("Concurrent sweeping\n");
                 }
 
@@ -194,10 +200,11 @@ void GcHeap::concurrent_collector() {
             sweep();
             pool_.with([&](Pool &pool, auto *lock) {
                 pool.concurrent_state = ConcurrentState::IDLE;
-                if constexpr (is_debug) {
+                if constexpr (verbose_output) {
                     std::printf("Concurrent collection done\n");
                 }
             });
+            stats_.last_collected = stats_.n_collected.load();
         });
         stats_.collection_time.update(t);
         stats_.n_collection_cycles.fetch_add(1, std::memory_order_relaxed);
@@ -381,8 +388,8 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
         }
         cnt++;
     }
-    stats_.n_collected.fetch_add(collect_cnt, std::memory_order_relaxed);
-    pool_.get().allocation_size_.fetch_sub(collected_bytes, std::memory_order_relaxed);
+    // stats_.n_collected.fetch_add(collect_cnt, std::memory_order_relaxed);
+    pool_.get().allocation_size_.fetch_sub(collected_bytes, std::memory_order_seq_cst);
     object_list.count.store(object_ist_cnt, std::memory_order_relaxed);
     if constexpr (verbose_output) { std::printf("sweeped %d objects, %d collected from pool %lld\n", cnt, collect_cnt, pool_idx); }
     return {collect_cnt, cnt, head, prev};

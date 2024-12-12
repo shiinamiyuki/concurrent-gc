@@ -47,11 +47,11 @@ static_assert(sizeof(size_t) == 8, "64-bit only");
 #endif
 namespace gc {
 #ifdef DEBUG
-constexpr bool is_debug = true;
+constexpr bool is_debug = false;
 #else
 constexpr bool is_debug = false;
 #endif
-constexpr bool verbose_output = false;
+constexpr bool verbose_output = true;
 extern bool enable_time_tracking;
 
 namespace detail {
@@ -928,7 +928,7 @@ class GcHeap {
             // }
             // heap->stats_.time_waiting_for_pool += heap->pool_.with_timed([&](auto &pool, auto *lock) {
             auto &pool = heap->pool_.get();
-            pool.allocation_size_.fetch_sub(bytes + sizeof(Metadata), std::memory_order_relaxed);
+            pool.allocation_size_.fetch_sub(bytes + sizeof(Metadata), std::memory_order_seq_cst);
             if constexpr (is_debug) {
                 std::printf("Deallocating %p, %lld bytes via pmr, %lld/%lldB used\n", p, bytes, pool.allocation_size_.load(), heap->max_heap_size_);
             }
@@ -1381,7 +1381,7 @@ class Member {
         auto &heap = get_heap();
 
         if (heap.need_write_barrier()) [[likely]] {
-            if (parent_->color() == color::BLACK) {
+            if (parent_->color() == color::BLACK || heap.mode() == GcMode::CONCURRENT) {
                 if constexpr (is_debug) {
                     std::printf("write barrier, color=%d\n", ptr.gc_object_container()->color());
                 }
