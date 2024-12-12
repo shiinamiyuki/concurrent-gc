@@ -47,7 +47,7 @@ static_assert(sizeof(size_t) == 8, "64-bit only");
 #endif
 namespace gc {
 #ifdef DEBUG
-constexpr bool is_debug = true;
+constexpr bool is_debug = false;
 #else
 constexpr bool is_debug = false;
 #endif
@@ -321,7 +321,7 @@ class GcObjectContainer {
     friend class GcPtr;
 protected:
     friend class GcHeap;
-    mutable std::atomic<uint8_t> color_ = color::WHITE;
+    mutable std::atomic<uint32_t> color_;
     mutable bool alive = true;
     uint8_t pool_idx_;
     mutable std::atomic<uint16_t> root_ref_count = 0;
@@ -332,7 +332,7 @@ protected:
     void set_alive(bool value) const {
         alive = value;
     }
-    void set_color(uint8_t value) const {
+    void set_color(uint32_t value) const {
         color_.store(value, std::memory_order_relaxed);
     }
     void inc_root_ref_count() const {
@@ -342,6 +342,7 @@ protected:
         root_ref_count.fetch_sub(1, std::memory_order_relaxed);
     }
 public:
+    GcObjectContainer();
     size_t pool_idx() const {
         return pool_idx_;
     }
@@ -349,7 +350,7 @@ public:
         // return root_ref_count > 0;
         return root_node.has_value();
     }
-    uint8_t color() const {
+    uint32_t color() const {
         return color_.load(std::memory_order_relaxed);
     }
     bool is_alive() const {
@@ -674,6 +675,7 @@ public:
 // };
 extern thread_local std::optional<size_t> tl_pool_idx;
 class GcHeap {
+    friend class GcObjectContainer;
     friend struct TracingContext;
     template<class T>
     friend class Member;
@@ -688,7 +690,7 @@ class GcHeap {
         IDLE,
         REQUESTED,
         MARKING,
-        ATOMIC_MARKING,
+        ATOMIC_MARK_SWEEP,
         SWEEPING
     };
     std::optional<ThreadPool> worker_pool_;
@@ -717,6 +719,10 @@ class GcHeap {
             }
         }
     };
+    uint32_t cycle_idx = 0;
+    void inc_cycle() {
+        cycle_idx += 2;
+    }
     GcStats stats_;
     struct ObjectList {
         GcObjectContainer *head = nullptr;
@@ -825,16 +831,16 @@ class GcHeap {
             std::fflush(stdout);
         }
         if (mode() != GcMode::CONCURRENT) {
-            GC_ASSERT(ptr->color() == color::GRAY || ptr->is_root(), "Object should be gray");
+            GC_ASSERT(ptr->color() == cycle_idx + color::GRAY || ptr->is_root(), "Object should be gray");
         }
-        if (ptr->color() == color::BLACK) {
+        if (ptr->color() == cycle_idx + color::BLACK) {
             return;
         }
         auto ctx = TracingContext{*this, pool_idx};
         if (auto traceable = ptr->as_tracable()) {
             traceable->trace(Tracer{ctx});
         }
-        ptr->set_color(color::BLACK);
+        ptr->set_color(cycle_idx + color::BLACK);
     }
     const GcObjectContainer *pop_from_working_list() {
         return work_list.get().pop();
@@ -849,6 +855,7 @@ class GcHeap {
             auto [mark_end, t_mark] = time_function([this] { return !mark_some(10); });
             stats_.incremental_time += t_mark;
             if (mark_end) {
+                inc_cycle();
                 auto t = time_function([this] {
                     sweep();
                 });
@@ -861,6 +868,7 @@ class GcHeap {
             if (pool_.get().allocation_size_ + inc_size > max_heap_size_) {
                 auto t = time_function([this] {
                     while (mark_some(10)) {}
+                    inc_cycle();
                     sweep();
                 });
                 stats_.incremental_time += t;
@@ -1012,7 +1020,7 @@ public:
                     //     detail::pause_thread();
                     //     lock->lock();
                     // }
-                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARK_SWEEP; });
                 });
             }
             if (preferred_pool_idx.has_value()) {
@@ -1049,7 +1057,7 @@ public:
                     //     detail::pause_thread();
                     //     lock->lock();
                     // }
-                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+                    lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARK_SWEEP; });
                 });
             }
             if (mode() != GcMode::STOP_THE_WORLD) {
@@ -1250,7 +1258,7 @@ class Local {
                     }
                     ptr_.root_node().emplace(node);
                 });
-                if (ptr_.gc_object_container()->color() == color::WHITE) {
+                if (ptr_.gc_object_container()->color() == heap.cycle_idx + color::WHITE) {
                     heap.stats_.time_waiting_for_work_list += heap.work_list.with_timed([&](auto &work_list, auto *lock) {
                         heap.shade(ptr_.gc_object_container(), work_list.least_filled());
                     });
@@ -1381,7 +1389,7 @@ class Member {
         auto &heap = get_heap();
 
         if (heap.need_write_barrier()) [[likely]] {
-            if (parent_->color() == color::BLACK || heap.mode() == GcMode::CONCURRENT) {
+            if (parent_->color() == heap.cycle_idx + color::BLACK || heap.mode() == GcMode::CONCURRENT) {
                 if constexpr (is_debug) {
                     std::printf("write barrier, color=%d\n", ptr.gc_object_container()->color());
                 }

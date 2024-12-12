@@ -1,6 +1,7 @@
 #include "gc.h"
 #include <optional>
 namespace gc {
+GcObjectContainer::GcObjectContainer() : color_(get_heap().cycle_idx + color::BLACK) {}
 bool enable_time_tracking = false;
 void TracingContext::shade(const GcObjectContainer *ptr) const noexcept {
     // heap.work_list.with([&](auto &wl, auto *lock) {
@@ -13,16 +14,33 @@ void GcHeap::shade(const GcObjectContainer *ptr, size_t pool_idx) {
             return;
         }
     }
-    if (!ptr || ptr->color() != color::WHITE)
+    if (!ptr || ptr->color() == cycle_idx + color::GRAY || ptr->color() == cycle_idx + color::BLACK)
         return;
     detail::check_alive(ptr);
     if (is_paralle_collection()) {
-        uint8_t expected = color::WHITE;
-        if (!ptr->color_.compare_exchange_strong(expected, color::GRAY)) {
-            return;
+        if (mode_ != GcMode::CONCURRENT) {
+            ptr->set_color(cycle_idx + color::GRAY);
+        } else {
+            uint32_t expected = cycle_idx + color::WHITE;
+            if (!ptr->color_.compare_exchange_strong(expected, cycle_idx + color::GRAY)) {
+                return;
+            }
         }
     } else {
-        ptr->set_color(color::GRAY);
+        if (mode_ != GcMode::CONCURRENT) {
+            ptr->set_color(cycle_idx + color::GRAY);
+        } else {
+            while (true) {
+                uint32_t expected = ptr->color();
+                    // ptr->set_color(cycle_idx + color::GRAY);
+                if(ptr->color_.compare_exchange_strong(expected, cycle_idx + color::GRAY)) {
+                    break;
+                }
+                if (expected == cycle_idx + color::BLACK) {
+                    return;
+                }
+            }
+        }
     }
     if (ptr->as_tracable()) {
         add_to_working_list(ptr, pool_idx);
@@ -76,7 +94,8 @@ void GcHeap::prepare_allocation_concurrent(size_t inc_size) {
                 auto since_last_collection = now - stats_.last_collect_time;
                 return since_last_collection > std::chrono::seconds(1);
             };
-            return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected;
+            return true;
+            // return pool.allocation_size_ + inc_size > max_heap_size_ * gc_threshold_ && (stats_.n_allocated - stats_.n_collected) >= stats_.last_collected;
         };
         stats_.wait_for_atomic_marking += time_function([&] {
             // while (pool.concurrent_state == ConcurrentState::ATOMIC_MARKING) {
@@ -87,7 +106,7 @@ void GcHeap::prepare_allocation_concurrent(size_t inc_size) {
             //     detail::pause_thread();
             //     lock->lock();
             // }
-            lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+            lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARK_SWEEP; });
         });
         // in concurrent mode, the mutator might allocate too fast such that a single sweep is not enough
         // this is partly due to newly allocated objects are only collected in the next sweep
@@ -130,7 +149,7 @@ void GcHeap::prepare_allocation_concurrent(size_t inc_size) {
                         //     detail::pause_thread();
                         //     lock->lock();
                         // }
-                        lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARKING; });
+                        lock->wait([this, &pool] { return pool.concurrent_state == ConcurrentState::ATOMIC_MARK_SWEEP; });
                         // while (pool.concurrent_state != ConcurrentState::IDLE) {
                         //     lock->unlock();
                         //     detail::pause_thread();
@@ -185,7 +204,7 @@ void GcHeap::concurrent_collector() {
             }
             pool_.with([&](Pool &pool, auto *lock) {
                 GC_ASSERT(pool.concurrent_state == ConcurrentState::MARKING, "State should be marking");
-                pool.concurrent_state = ConcurrentState::ATOMIC_MARKING;
+                pool.concurrent_state = ConcurrentState::ATOMIC_MARK_SWEEP;
 
                 if constexpr (verbose_output) {
                     std::printf("Concurrent sweeping\n");
@@ -196,6 +215,7 @@ void GcHeap::concurrent_collector() {
                 } else {
                     while (mark_some(0xff)) {}
                 }
+                inc_cycle();
             });
             sweep();
             pool_.with([&](Pool &pool, auto *lock) {
@@ -331,6 +351,7 @@ void GcHeap::scan_roots() {
     }
 }
 std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::sweep_list(ObjectList &object_list, size_t pool_idx) {
+    uint32_t prev_cycle_idx = cycle_idx - 2;
     if constexpr (is_debug) {
         std::printf("sweeping list %p\n", static_cast<void *>(object_list.head));
         std::printf("starting sweep, pool_idx = %lld\n", pool_idx);
@@ -344,7 +365,7 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
             if (ptr->is_root()) {
                 root_cnt++;
                 reacheable_cnt++;
-            } else if (ptr->color() == color::BLACK) {
+            } else if (ptr->color() == prev_cycle_idx + color::BLACK) {
                 reacheable_cnt++;
             }
             ptr = ptr->next_;
@@ -363,15 +384,19 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
         // if (mode() != GcMode::CONCURRENT) {
         //     GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
         // }
-        GC_ASSERT(ptr->color() != color::GRAY, "Object should not be gray");
-        if (ptr->is_root()) {
-            GC_ASSERT(ptr->color() == color::BLACK, "Root should be black");
+        GC_ASSERT(ptr->color() != prev_cycle_idx + color::GRAY, "Object should not be gray");
+        if (mode() != GcMode::CONCURRENT) {
+            if (ptr->is_root()) {
+                GC_ASSERT(ptr->color() == prev_cycle_idx + color::BLACK, "Root should be black");
+            }
         }
-        if (ptr->color() == color::BLACK) {
+        if (ptr->color() == prev_cycle_idx + color::BLACK) {
             prev = ptr;
-            ptr->set_color(color::WHITE);
+            // uint32_t expected = color::BLACK + prev_cycle_idx;
+            // ptr->set_color(color::WHITE);
+            // ptr->color_.compare_exchange_strong(expected, cycle_idx + color::WHITE);
             ptr = next;
-        } else {
+        } else if (ptr->color() == prev_cycle_idx + color::WHITE) {
             collected_bytes += ptr->object_size();
             free_object(ptr, pool_idx);
 
@@ -385,6 +410,10 @@ std::tuple<size_t, size_t, GcObjectContainer *, GcObjectContainer *> GcHeap::swe
             }
             ptr = next;
             collect_cnt++;
+        } else {
+            GC_ASSERT(ptr->color() >= cycle_idx, "Color should be greater than cycle_idx");
+            prev = ptr;
+            ptr = next;
         }
         cnt++;
     }
@@ -398,6 +427,7 @@ void GcHeap::sweep() {
     if (mode_ != GcMode::CONCURRENT) {
         state() = State::SWEEPING;
     }
+
     auto t = time_function([&] {
         // GcObjectContainer *head = nullptr;
         // GcObjectContainer *ptr = nullptr;
@@ -425,9 +455,9 @@ void GcHeap::sweep() {
                 });
             }
         });
-        // pool_.with([&](auto &pool, auto *lock) {
-        //     pool.concurrent_state = ConcurrentState::SWEEPING;
-        // });
+        pool_.with([&](auto &pool, auto *lock) {
+            pool.concurrent_state = ConcurrentState::SWEEPING;
+        });
         auto do_sweep = [&](size_t i) {
             GC_ASSERT(object_lists.size() == object_lists_.get().lists.size(), "Size should be the same");
             auto t0 = std::chrono::high_resolution_clock::now();
@@ -493,7 +523,7 @@ void GcHeap::collect() {
                 list->with([&](auto &list, auto *lock) {
                     auto ptr = list.head;
                     while (ptr) {
-                        ptr->set_color(color::WHITE);
+                        ptr->set_color(cycle_idx + color::WHITE);
                         ptr = ptr->next_;
                     }
                 });
@@ -522,6 +552,7 @@ void GcHeap::collect() {
             }
         }
         GC_ASSERT(work_list.get().empty(), "Work list should be empty");
+        inc_cycle();
         sweep();
     },
                            true);
