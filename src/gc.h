@@ -22,6 +22,7 @@
 #include "pmr-mimalloc.h"
 
 static_assert(sizeof(size_t) == 8, "64-bit only");
+#if defined(__x86_64__) || defined(_M_X64) || defined(_WIN64)
 #define GC_ASSERT(x, msg)                                    \
     do {                                                     \
         if (!(x)) [[unlikely]] {                             \
@@ -33,6 +34,16 @@ static_assert(sizeof(size_t) == 8, "64-bit only");
             std::abort();                                    \
         }                                                    \
     } while (0)
+#else
+#define GC_ASSERT(x, msg)                                    \
+    do {                                                     \
+        if (!(x)) [[unlikely]] {                             \
+            std::cerr << "Assertion failed: at "             \
+                      << __FILE__ << ":" << __LINE__ << "\n" \
+                      << msg << "\n" std::abort();           \
+        }                                                    \
+    } while (0)
+#endif
 namespace gc {
 #ifdef DEBUG
 constexpr bool is_debug = true;
