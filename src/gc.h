@@ -47,11 +47,11 @@ static_assert(sizeof(size_t) == 8, "64-bit only");
 #endif
 namespace gc {
 #ifdef DEBUG
-constexpr bool is_debug = false;
+constexpr bool is_debug = true;
 #else
 constexpr bool is_debug = false;
 #endif
-constexpr bool verbose_output = true;
+constexpr bool verbose_output = false;
 extern bool enable_time_tracking;
 
 namespace detail {
