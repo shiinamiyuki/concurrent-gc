@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.26)
 project(current-gc)
 
 set(CMAKE_CXX_STANDARD 23)
+
 # enable LTO
 include(CheckIPOSupported)
 
@@ -9,18 +10,22 @@ add_subdirectory(mimalloc)
 
 add_library(gc STATIC src/gc.h src/gc.cpp src/rc.h src/rc.cpp src/pmr-mimalloc.h)
 target_link_libraries(gc PUBLIC mimalloc-static)
+
 # if linux, link stdc++_libbacktrace
-if (UNIX AND NOT APPLE)
-    target_link_libraries(gc PUBLIC stdc++_libbacktrace)
+if(UNIX AND NOT APPLE)
+    # when not on aarch64, link stdc++_libbacktrace
+    if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+        target_link_libraries(gc PUBLIC stdc++_libbacktrace)
+    endif()
+
     target_compile_options(gc PUBLIC -Wno-format)
 endif()
 
 set_property(TARGET gc PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_definitions(gc PUBLIC DEBUG)
 endif()
-
-
 
 add_executable(test src/test.cpp)
 set_property(TARGET test PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
