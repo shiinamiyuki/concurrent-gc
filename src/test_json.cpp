@@ -5,7 +5,6 @@
 #include <array>
 #include <variant>
 #include <sstream>
-#include <format>
 #include <fstream>
 #include <cmath>
 template<class C>
@@ -311,15 +310,15 @@ struct Formatter {
             } else if constexpr (std::is_same_v<std::decay_t<decltype(v)>, bool>) {
                 write(v ? "true" : "false");
             } else if constexpr (std::is_same_v<std::decay_t<decltype(v)>, double>) {
-                ss << std::format("{:.17g}", v);
+                ss << v;
             } else if constexpr (std::is_same_v<std::decay_t<decltype(v)>, std::string>) {
-                ss << std::format("\"{}\"", v);
+                ss << "\"" << v << "\"";
             } else if constexpr (std::is_same_v<std::decay_t<decltype(v)>, typename C::template Member<JsonDict<C>>>) {
                 write_line("{");
                 indent++;
                 for (auto &&[key, value] : *v) {
                     write_indent();
-                    ss << std::format("\"{}\": ", key->c_str());
+                    ss << "\"" << *key << "\": ";
                     format_impl(*value);
                     ss << ",\n";
                 }
