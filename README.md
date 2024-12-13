@@ -5,7 +5,7 @@ A C++23 compiler is required to build the project. The project is built using CM
 ```bash
 mkdir build
 cd build
-cmake .. -GNinja
+cmake .. -GNinja -DCMAKE_BUILD_TYPE=Release
 ninja
 ```
 
